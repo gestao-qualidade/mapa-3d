@@ -41,7 +41,8 @@ const POST_SIZE     = 0.12;
 const BLOCK_GAP     = 18;     // espaço entre o galpão principal e o bloco fictício
 const COLUMN_TAG_STEP = 5;    // a cada quantas colunas colocar uma plaquinha numerada
 
-const ITEM_FIELDS = ["cliente","codigo","desc","qtde","lote","validade","vencido","perecivel","danificado","giroScore","familia"];
+const ITEM_FIELDS = ["cliente","codigo","desc","qtde","lote","validade","vencido","perecivel","danificado","giroScore","familia",
+  "valorUnitario","reservado","ultimaEntrada","ultimaSaida","fornecedor","diasParadoFaixa"];
 function itemToObj(arr){ const o = {}; ITEM_FIELDS.forEach((k,i)=>o[k]=arr[i]); return o; }
 
 /* =========================================================================
@@ -93,6 +94,17 @@ function corFamilia(fam){
 // então a pintura de piso segue a ORDEM real das ruas (01, 02, 03...) lida na
 // planta — não é mais uma proporção estimada, mas também não é confirmada
 // posição-a-posição com o WMS.
+// cores da grade da Visão 2D (status por posição) — paleta parecida com o
+// padrão de mercado (verde=ocupado ok, cinza=vazio, vermelho=vencido,
+// laranja=a vencer, roxo=danificado), reaproveitada também na legenda.
+const STATUS2D_CORES = {
+  ocupado:    "#2e8b57",
+  vazio:      "#3a4046",
+  vencido:    "#c0392b",
+  aVencer:    "#e8a13a",
+  danificado: "#8a4fb0"
+};
+const STATUS2D_LABELS = { ocupado:"Ocupado", vazio:"Vazio", vencido:"Vencido", aVencer:"A vencer ≤15d", danificado:"Danificado" };
 const ZONA_CORES = {
   alimentos:     0x2e8b57,
   cosmeticos:    0xe08a2e,
@@ -165,6 +177,18 @@ function riscoValidadePosicao(itens, hoje){
   });
   return pior;
 }
+// marca position.alerta = true quando a posição tem item vencido, crítico
+// (vence em até 7 dias) ou danificado — usado no contador do topo e no
+// ícone de alerta da lista de busca.
+function annotatePositions(positions){
+  const hoje = new Date(); hoje.setHours(0,0,0,0);
+  positions.forEach(p=>{
+    const risco = riscoValidadePosicao(p.itens, hoje);
+    const danificado = p.itens.some(it=>isTruthy(it[8]));
+    p.alerta = risco === "vencido" || risco === "critico" || danificado;
+  });
+  return positions;
+}
 
 /* =========================================================================
    IMPORTAÇÃO DE PLANILHA DO ERP (.xls / .xlsx / .csv)
@@ -230,7 +254,13 @@ function convertErpRowsToPositions(rows){
       isSimOuS(row["Perecivel"]),                  // perecivel
       isSimOuS(row["Danificado"]),                 // danificado
       giroScore,                                    // giroScore
-      String(row["Familia"]||"").trim()             // familia (BRINDE, VESTUARIO, DISPLAY, PRODUTO, GRÁFICO...)
+      String(row["Familia"]||"").trim(),            // familia (BRINDE, VESTUARIO, DISPLAY, PRODUTO, GRÁFICO...)
+      parseFloat(row["VALOR UNITARIO MEDIO"]) || 0, // valorUnitario (R$)
+      parseFloat(row["Reservado"]) || 0,            // reservado (qtd reservada do lote, 0 = nenhuma)
+      erpDateToIso(row["DATA ULTIMA ENTRADA"]),     // ultimaEntrada (ISO)
+      erpDateToIso(row["DATA ULTIMA SAIDA"]),       // ultimaSaida (ISO, pode ser vazio — nem todo item já saiu)
+      String(row["CodFornecedor"]||"").trim(),      // fornecedor
+      String(row["STATUS"]||"").trim()              // diasParadoFaixa (faixa de dias sem mov.: "ABAIXO DE 30 DIAS" etc.)
     ];
     if(!byPos.has(posId)) byPos.set(posId, { pos:posId, rua, col, niv, itens:[], _giroSum:0, _giroCount:0 });
     const p = byPos.get(posId);
@@ -253,238 +283,6 @@ async function readErpFile(file){
   const positions = convertErpRowsToPositions(rows);
   if(!positions.length) throw new Error("Nenhuma posição válida encontrada nessa planilha.");
   return positions;
-}
-
-/* =========================================================================
-   IA DO ESTOQUE (Gemini, grátis)
-   Em vez de mandar o estoque inteiro (pode ter dezenas de milhares de itens)
-   pro modelo, a gente manda um RESUMO agregado (totais, top clientes, ruas)
-   mais, se a pergunta citar uma posição ou código de cliente específico, os
-   dados detalhados só daquele recorte. Isso mantém a resposta rápida e
-   barata mesmo no plano gratuito.
-   ========================================================================= */
-function buildEstoqueSummary(data){
-  const hoje = new Date(); hoje.setHours(0,0,0,0);
-  let totalItens = 0, vencidos = 0, criticos = 0, atencao = 0, danificados = 0;
-  const porCliente = new Map();
-  const porRua = new Map(); // rua -> { posicoesOcupadas, itens, vencidos, criticos, atencao, danificados }
-  data.forEach(p=>{
-    if(!porRua.has(p.rua)) porRua.set(p.rua, { rua:p.rua, posicoesOcupadas:0, itens:0, vencidos:0, criticos:0, atencao:0, danificados:0 });
-    const r = porRua.get(p.rua);
-    r.posicoesOcupadas++;
-    p.itens.forEach(it=>{
-      totalItens++;
-      r.itens++;
-      const obj = itemToObj(it);
-      const cli = String(obj.cliente||"").trim() || "(sem cliente)";
-      if(!porCliente.has(cli)) porCliente.set(cli, { cliente:cli, itens:0, qtde:0, vencidos:0, danificados:0, ruas:new Set() });
-      const c = porCliente.get(cli);
-      c.itens++; c.qtde += Number(obj.qtde)||0; c.ruas.add(p.rua);
-      const risco = riscoValidadeItem(it, hoje);
-      if(risco === "vencido"){ vencidos++; c.vencidos++; r.vencidos++; }
-      else if(risco === "critico"){ criticos++; r.criticos++; }
-      else if(risco === "atencao"){ atencao++; r.atencao++; }
-      if(isTruthy(obj.danificado)){ danificados++; c.danificados++; r.danificados++; }
-    });
-  });
-  // ranking de clientes: por volume de itens, e separado por quem tem mais problemas
-  // (isso deixa a IA capaz de responder perguntas de priorização sem precisar do detalhe item a item)
-  const clientesArr = Array.from(porCliente.values()).map(c=>({ ...c, ruas: Array.from(c.ruas) }));
-  const topClientesPorQtdItens = [...clientesArr].sort((a,b)=>b.itens-a.itens).slice(0,20);
-  const topClientesPorVencidos = [...clientesArr].filter(c=>c.vencidos>0).sort((a,b)=>b.vencidos-a.vencidos).slice(0,15);
-  const topClientesPorDanificados = [...clientesArr].filter(c=>c.danificados>0).sort((a,b)=>b.danificados-a.danificados).slice(0,15);
-  const ruasArr = Array.from(porRua.values());
-  const ruasComMaisAlertas = [...ruasArr].sort((a,b)=>(b.vencidos+b.criticos+b.danificados)-(a.vencidos+a.criticos+a.danificados)).slice(0,15);
-  return {
-    totalPosicoes: data.length, totalItens, totalClientes: porCliente.size,
-    itensVencidos: vencidos, itensVenceEm7Dias: criticos, itensVenceEm15Dias: atencao,
-    itensDanificados: danificados,
-    topClientesPorQtdItens, topClientesPorVencidos, topClientesPorDanificados,
-    posicoesOcupadasPorRua: ruasArr.map(r=>({ rua:r.rua, posicoesOcupadas:r.posicoesOcupadas })),
-    ruasComMaisAlertas
-  };
-}
-// se a pergunta citar um código de posição ou de cliente que existe nos
-// dados, devolve só aquele recorte (evita ter que mandar tudo). A busca é
-// tolerante: aceita token parcial/contido no nome do cliente, não só igualdade
-// exata, para a IA conseguir responder mesmo quando a pergunta usa parte do
-// nome, abreviação ou minúsculas.
-function findRelevantSlice(data, question){
-  const qUpper = String(question||"").toUpperCase();
-  const tokens = qUpper.match(/[A-Z0-9.\-]{2,}/g) || [];
-  if(!tokens.length) return null;
-  const tokenSet = new Set(tokens);
-
-  // 1) match exato de código de posição
-  const posMatches = data.filter(p=>tokenSet.has(String(p.pos).toUpperCase()));
-  if(posMatches.length){
-    return { tipo:"posicoes", dados: posMatches.slice(0,15).map(p=>({
-      pos:p.pos, rua:p.rua, col:p.col, niv:p.niv, itens:p.itens.map(itemToObj)
-    })) };
-  }
-
-  // 2) match de rua específica (ex.: "rua 5", "corredor A")
-  const ruaTokenMatch = qUpper.match(/\b(?:RUA|CORREDOR)\s+([A-Z0-9]{1,4})\b/);
-  if(ruaTokenMatch){
-    const ruaAlvo = ruaTokenMatch[1];
-    const posDaRua = data.filter(p=>String(p.rua).toUpperCase()===ruaAlvo);
-    if(posDaRua.length){
-      return { tipo:"itensDaRua", dados: posDaRua.slice(0,40).map(p=>({
-        pos:p.pos, col:p.col, niv:p.niv, itens:p.itens.map(itemToObj)
-      })) };
-    }
-  }
-
-  // 3) match de cliente: primeiro tenta igualdade exata do nome inteiro do
-  // cliente com algum token da pergunta; se não achar nada, tenta match
-  // parcial (nome do cliente contém o token, ou vice-versa)
-  const clienteMatches = [];
-  data.forEach(p=>{
-    p.itens.forEach(it=>{
-      const obj = itemToObj(it);
-      const cliUpper = String(obj.cliente||"").toUpperCase().trim();
-      if(!cliUpper) return;
-      if(tokenSet.has(cliUpper)){
-        clienteMatches.push({ pos:p.pos, rua:p.rua, ...obj });
-      }
-    });
-  });
-  if(clienteMatches.length) return { tipo:"itensDoCliente", dados: clienteMatches.slice(0,80) };
-
-  const clienteParcial = [];
-  const tokensLongos = tokens.filter(t=>t.length>=3);
-  if(tokensLongos.length){
-    data.forEach(p=>{
-      p.itens.forEach(it=>{
-        const obj = itemToObj(it);
-        const cliUpper = String(obj.cliente||"").toUpperCase().trim();
-        if(!cliUpper) return;
-        if(tokensLongos.some(t=>cliUpper.includes(t) || t.includes(cliUpper))){
-          clienteParcial.push({ pos:p.pos, rua:p.rua, ...obj });
-        }
-      });
-    });
-  }
-  if(clienteParcial.length) return { tipo:"itensDoClienteAproximado", dados: clienteParcial.slice(0,80) };
-
-  // 4) match de lote/código de item (campo "codigo" ou "lote" do item)
-  const codigoMatches = [];
-  data.forEach(p=>{
-    p.itens.forEach(it=>{
-      const obj = itemToObj(it);
-      const cod = String(obj.codigo||"").toUpperCase();
-      const lote = String(obj.lote||"").toUpperCase();
-      if((cod && tokenSet.has(cod)) || (lote && tokenSet.has(lote))){
-        codigoMatches.push({ pos:p.pos, rua:p.rua, ...obj });
-      }
-    });
-  });
-  if(codigoMatches.length) return { tipo:"itensPorCodigoOuLote", dados: codigoMatches.slice(0,40) };
-
-  return null;
-}
-// tenta vários modelos do Gemini em sequência: se um não existir/estiver
-// indisponível (ex.: descontinuado), cai pro próximo automaticamente
-const GEMINI_MODEL_CANDIDATES = [
-  "gemini-2.5-flash",
-  "gemini-2.5-flash-lite",
-  "gemini-3-flash-preview",
-  "gemini-3.1-flash-lite",
-  "gemini-3.5-flash"
-];
-// chamada crua ao Gemini, com fallback entre modelos — compartilhada pelo
-// chat e pela análise estruturada, pra não duplicar a lógica de retry
-async function chamarGemini(apiKey, promptText, opts){
-  opts = opts || {};
-  let lastError = null;
-  for(const model of GEMINI_MODEL_CANDIDATES){
-    try{
-      const res = await fetch(
-        "https://generativelanguage.googleapis.com/v1beta/models/" + model + ":generateContent",
-        {
-          method: "POST",
-          headers: { "Content-Type":"application/json", "x-goog-api-key": apiKey },
-          body: JSON.stringify({ contents: [{ parts: [{ text: promptText }] }],
-            generationConfig: { temperature: opts.temperature!=null?opts.temperature:0.3,
-              maxOutputTokens: opts.maxOutputTokens || 1536,
-              responseMimeType: opts.json ? "application/json" : undefined } })
-        }
-      );
-      if(!res.ok){ lastError = model + ": HTTP " + res.status; continue; }
-      const json = await res.json();
-      const text = json && json.candidates && json.candidates[0] && json.candidates[0].content &&
-        json.candidates[0].content.parts && json.candidates[0].content.parts[0] &&
-        json.candidates[0].content.parts[0].text;
-      if(text) return { text, model };
-      lastError = model + ": resposta vazia";
-    }catch(e){
-      lastError = model + ": " + (e.message||e);
-    }
-  }
-  throw new Error("Nenhum modelo do Gemini respondeu. Último erro: " + lastError);
-}
-async function askGeminiSobreEstoque(apiKey, question, summary, slice, historico, analiseAtual){
-  const promptText =
-    "Você é um analista sênior de estoque e armazenagem, ajudando o gestor de um galpão a interpretar os " +
-    "dados do sistema. Responda sempre em português do Brasil, de forma direta e útil.\n\n" +
-    "COMO USAR OS DADOS:\n" +
-    "- O RESUMO GERAL cobre o estoque inteiro (totais, ranking de clientes por volume/vencidos/danificados, " +
-    "ocupação e alertas por rua) — use-o para perguntas amplas, comparações, rankings, tendências e contas.\n" +
-    (analiseAtual ? "- Já existe um DIAGNÓSTICO GERADO ANTERIORMENTE (riscos, oportunidades, anomalias e " +
-    "recomendações já levantados) — use-o como pano de fundo pra responder de forma consistente com o que já " +
-    "foi apontado, e cite/aprofunde esses pontos quando a pergunta se relacionar a eles.\n" : "") +
-    "- Quando houver um bloco de DADOS ESPECÍFICOS, ele traz o recorte exato (posição, rua ou cliente) que a " +
-    "pergunta parece estar citando — priorize-o para responder sobre itens, lotes ou posições individuais.\n" +
-    "- Sinta-se livre para cruzar informações, somar, comparar e tirar conclusões práticas (ex.: priorização, " +
-    "riscos, sugestões de ação) em vez de só repetir números soltos.\n" +
-    "- Só diga que não é possível responder se o RESUMO e os DADOS ESPECÍFICOS realmente não cobrirem o que foi " +
-    "perguntado; nesse caso explique rapidamente o que falta, sem inventar números.\n" +
-    "- Formate como lista curta quando ajudar a leitura; senão, poucos parágrafos objetivos.\n\n" +
-    "RESUMO GERAL DO ESTOQUE (JSON):\n" + JSON.stringify(summary) + "\n\n" +
-    (analiseAtual ? "DIAGNÓSTICO JÁ GERADO ANTERIORMENTE (JSON):\n" + JSON.stringify({
-      resumoExecutivo: analiseAtual.resumoExecutivo, riscosCriticos: analiseAtual.riscosCriticos,
-      oportunidades: analiseAtual.oportunidades, anomalias: analiseAtual.anomalias,
-      recomendacoes: analiseAtual.recomendacoes }) + "\n\n" : "") +
-    (slice ? "DADOS ESPECÍFICOS RELACIONADOS À PERGUNTA (JSON):\n" + JSON.stringify(slice) + "\n\n" : "") +
-    (historico && historico.length ? "HISTÓRICO RECENTE DA CONVERSA:\n" + historico.map(m=>
-      (m.role==="user" ? "Usuário: " : "Você: ") + m.text).join("\n") + "\n\n" : "") +
-    "PERGUNTA ATUAL: " + question;
-  return chamarGemini(apiKey, promptText, { temperature:0.3, maxOutputTokens:1536 });
-}
-
-// -----------------------------------------------------------------------
-// ANÁLISE INTELIGENTE — em vez de esperar uma pergunta, pede pro Gemini
-// varrer o resumo inteiro e devolver um diagnóstico estruturado (JSON),
-// que a UI transforma em cartões: resumo executivo, riscos críticos,
-// oportunidades, anomalias e recomendações práticas e priorizadas.
-// -----------------------------------------------------------------------
-async function gerarAnaliseCompletaIA(apiKey, summary){
-  const promptText =
-    "Você é um consultor sênior de supply chain/WMS contratado pra dar um diagnóstico executivo do estoque " +
-    "de um centro de distribuição, pra ser apresentado à diretoria. Responda SOMENTE com um JSON válido " +
-    "(sem markdown, sem \\`\\`\\`, sem texto fora do JSON), em português do Brasil, no formato exato:\n" +
-    '{"resumoExecutivo":"2-3 frases objetivas sobre a saúde geral do estoque",' +
-    '"riscosCriticos":[{"titulo":"...","detalhe":"...","impacto":"alto|medio|baixo"}],' +
-    '"oportunidades":[{"titulo":"...","detalhe":"..."}],' +
-    '"anomalias":[{"titulo":"...","detalhe":"..."}],' +
-    '"recomendacoes":[{"acao":"...","motivo":"...","prioridade":"alta|media|baixa"}]}\n\n' +
-    "Regras:\n" +
-    "- Baseie-se SOMENTE nos números do RESUMO abaixo — não invente dados que não estão ali.\n" +
-    "- riscosCriticos: itens vencidos/a vencer/danificados que merecem atenção imediata, com números reais.\n" +
-    "- oportunidades: coisas como ruas quase lotadas, clientes concentrando muito volume, otimização de espaço.\n" +
-    "- anomalias: padrões estranhos nos dados (ex.: rua com alerta desproporcional, cliente só com problemas).\n" +
-    "- recomendacoes: 3 a 6 ações práticas e priorizadas, específicas o bastante pra alguém executar.\n" +
-    "- 3 a 6 itens em cada lista (menos se os dados não sustentarem mais que isso). Nunca deixe uma lista vazia " +
-    "se houver QUALQUER dado relevante no resumo; só deixe vazia se genuinamente não houver nada a reportar " +
-    "naquela categoria.\n\n" +
-    "RESUMO GERAL DO ESTOQUE (JSON):\n" + JSON.stringify(summary);
-
-  const { text, model } = await chamarGemini(apiKey, promptText, { temperature:0.25, maxOutputTokens:2400, json:true });
-  const cleaned = text.replace(/^```json\s*|\s*```$/g, "").trim();
-  let parsed;
-  try{ parsed = JSON.parse(cleaned); }
-  catch(e){ throw new Error("A IA respondeu num formato inesperado. Tente novamente."); }
-  return { analise: parsed, model };
 }
 
 /* =========================================================================
@@ -651,6 +449,15 @@ function DetailPanel({ selected, onClose }){
         h("span", null, "Val: ", it.validade || "\u2014"),
         it.familia && h("span", null, "Família: ", it.familia)
       ),
+      h("div", { style:{ display:"flex", gap:12, flexWrap:"wrap", color:"#6b6f74", fontSize:10.5, marginBottom:4 } },
+        it.valorUnitario>0 && h("span", null, "Valor unit.: ", h("strong", { style:{ color:"#a8a29a" } },
+          "R$ " + it.valorUnitario.toLocaleString("pt-BR", { minimumFractionDigits:2, maximumFractionDigits:2 }))),
+        it.reservado>0 && h("span", null, "Reservado: ", h("strong", { style:{ color:"#a8a29a" } }, it.reservado)),
+        it.ultimaEntrada && h("span", null, "Últ. entrada: ", it.ultimaEntrada),
+        it.ultimaSaida && h("span", null, "Últ. saída: ", it.ultimaSaida),
+        it.fornecedor && h("span", null, "Fornecedor: ", it.fornecedor),
+        it.diasParadoFaixa && h("span", null, "Parado: ", it.diasParadoFaixa)
+      ),
       h("div", { style:{ display:"flex", gap:6, flexWrap:"wrap" } },
         isTruthy(it.vencido) && h("span", { style:{ fontSize:10, background:"rgba(192,57,43,0.25)", color:"#ff8a80", padding:"1px 6px", borderRadius:4 } }, "VENCIDO"),
         isTruthy(it.danificado) && h("span", { style:{ fontSize:10, background:"rgba(192,57,43,0.25)", color:"#ff8a80", padding:"1px 6px", borderRadius:4 } }, "DANIFICADO"),
@@ -746,88 +553,6 @@ function InfoGalpaoPanel({ open, onClose, isMobile }){
   );
 }
 
-const IMPACTO_COR = { alto:"#e63946", medio:"#e8a13a", baixo:"#4a90a4" };
-const PRIORIDADE_COR = { alta:"#e63946", media:"#e8a13a", baixa:"#4a90a4" };
-
-function AnaliseIAPanel({ open, onClose, isMobile, geminiKey, analise, loading, erro, onGerar }){
-  if(!open) return null;
-  return h("div", {
-    style:{ position:"absolute", top:0, left:0, width:400, maxWidth:"92vw", height:"100%",
-      background:"rgba(17,20,23,0.98)", color:"#f4efe6", padding:"20px 18px", overflowY:"auto",
-      boxShadow:"8px 0 24px rgba(0,0,0,0.4)", fontFamily:"'Inter', system-ui, sans-serif",
-      borderRight:"1px solid rgba(232,161,58,0.3)", zIndex:21, fontSize:12.5, lineHeight:1.5 }
-  },
-    h("div", { style:{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:4 } },
-      h("h2", { style:{ margin:0, fontSize:16, color:"#e8a13a" } }, "\u{1F9E0} Análise Inteligente"),
-      h("button", { onClick:onClose, style:{ background:"none", border:"none", color:"#a8a29a", fontSize:20, cursor:"pointer", lineHeight:1 } }, "\xD7")
-    ),
-    h("p", { style:{ margin:"0 0 12px", fontSize:10.5, color:"#6b6f74" } },
-      "Diagnóstico gerado por IA a partir dos dados atuais do estoque — não substitui a validação de um analista."),
-
-    !geminiKey && h("div", { style:{ fontSize:12, color:"#a8a29a", padding:"10px 0" } },
-      "Configure a chave do Gemini no chat (\u{1F916}) primeiro pra poder gerar a análise."),
-
-    geminiKey && h("button", { onClick:onGerar, disabled:loading, style:{ width:"100%", padding:"9px 12px",
-      borderRadius:8, border:"none", background: loading ? "rgba(232,161,58,0.4)" : "#c9781f", color:"#1c1408",
-      fontSize:13, fontWeight:700, cursor: loading ? "default" : "pointer", marginBottom:14 } },
-      loading ? "Analisando o estoque..." : (analise ? "\u{1F504} Atualizar análise" : "\u2728 Gerar análise agora")),
-
-    erro && h("div", { style:{ fontSize:11, color:"#ff8a80", marginBottom:12, background:"rgba(192,57,43,0.15)",
-      padding:"8px 10px", borderRadius:6 } }, "\u26A0 ", erro),
-
-    !analise && !loading && !erro && h("div", { style:{ fontSize:12, color:"#6b6f74", textAlign:"center", padding:"30px 10px" } },
-      "Nenhuma análise gerada ainda. Clique no botão acima."),
-
-    analise && h(React.Fragment, null,
-      h("div", { style:{ fontSize:10, color:"#6b6f74", marginBottom:10 } },
-        "Gerada em ", new Date(analise.geradaEm).toLocaleString("pt-BR"), analise.model ? " \xB7 " + analise.model : ""),
-
-      h("div", { style:{ background:"rgba(142,207,245,0.08)", border:"1px solid rgba(142,207,245,0.25)",
-        borderRadius:8, padding:"10px 12px", marginBottom:14, fontSize:12.5 } },
-        h("div", { style:{ fontWeight:700, color:"#8ecff5", marginBottom:4 } }, "Resumo executivo"),
-        analise.resumoExecutivo),
-
-      analise.riscosCriticos && analise.riscosCriticos.length>0 && h("div", { style:{ marginBottom:14 } },
-        h("div", { style:{ fontWeight:700, color:"#ff8a80", marginBottom:6 } }, "\u26A0 Riscos críticos"),
-        analise.riscosCriticos.map((r,i)=> h("div", { key:i, style:{ borderLeft:"3px solid "+(IMPACTO_COR[r.impacto]||"#e63946"),
-          background:"rgba(255,255,255,0.04)", padding:"6px 10px", marginBottom:6, borderRadius:4 } },
-          h("div", { style:{ display:"flex", justifyContent:"space-between", alignItems:"center" } },
-            h("strong", null, r.titulo),
-            r.impacto && h("span", { style:{ fontSize:9, textTransform:"uppercase", color:IMPACTO_COR[r.impacto]||"#e63946",
-              border:"1px solid "+(IMPACTO_COR[r.impacto]||"#e63946"), borderRadius:4, padding:"1px 5px" } }, r.impacto)),
-          h("div", { style:{ color:"#a8a29a", marginTop:2 } }, r.detalhe)))
-      ),
-
-      analise.oportunidades && analise.oportunidades.length>0 && h("div", { style:{ marginBottom:14 } },
-        h("div", { style:{ fontWeight:700, color:"#7fd99a", marginBottom:6 } }, "\u{1F4C8} Oportunidades"),
-        analise.oportunidades.map((o,i)=> h("div", { key:i, style:{ borderLeft:"3px solid #2e8b57",
-          background:"rgba(255,255,255,0.04)", padding:"6px 10px", marginBottom:6, borderRadius:4 } },
-          h("strong", null, o.titulo),
-          h("div", { style:{ color:"#a8a29a", marginTop:2 } }, o.detalhe)))
-      ),
-
-      analise.anomalias && analise.anomalias.length>0 && h("div", { style:{ marginBottom:14 } },
-        h("div", { style:{ fontWeight:700, color:"#d9a4ff", marginBottom:6 } }, "\u{1F50D} Anomalias"),
-        analise.anomalias.map((a,i)=> h("div", { key:i, style:{ borderLeft:"3px solid #8a4fb0",
-          background:"rgba(255,255,255,0.04)", padding:"6px 10px", marginBottom:6, borderRadius:4 } },
-          h("strong", null, a.titulo),
-          h("div", { style:{ color:"#a8a29a", marginTop:2 } }, a.detalhe)))
-      ),
-
-      analise.recomendacoes && analise.recomendacoes.length>0 && h("div", { style:{ marginBottom:6 } },
-        h("div", { style:{ fontWeight:700, color:"#e8a13a", marginBottom:6 } }, "\u2705 Recomendações"),
-        analise.recomendacoes.map((rc,i)=> h("div", { key:i, style:{ borderLeft:"3px solid "+(PRIORIDADE_COR[rc.prioridade]||"#e8a13a"),
-          background:"rgba(255,255,255,0.04)", padding:"6px 10px", marginBottom:6, borderRadius:4 } },
-          h("div", { style:{ display:"flex", justifyContent:"space-between", alignItems:"center" } },
-            h("strong", null, rc.acao),
-            rc.prioridade && h("span", { style:{ fontSize:9, textTransform:"uppercase", color:PRIORIDADE_COR[rc.prioridade]||"#e8a13a",
-              border:"1px solid "+(PRIORIDADE_COR[rc.prioridade]||"#e8a13a"), borderRadius:4, padding:"1px 5px" } }, rc.prioridade)),
-          h("div", { style:{ color:"#a8a29a", marginTop:2 } }, rc.motivo)))
-      )
-    )
-  );
-}
-
 const PALLET_HEIGHT = 0.14;
 // quantos "níveis de empilhamento" mostrar, de acordo com quantos lotes/SKUs
 // existem na posição — é uma representação GENÉRICA (não é a caixa real),
@@ -877,8 +602,348 @@ function tierStackHeight(tier){
 }
 
 /* =========================================================================
+   MENU LATERAL DO APP (navegação entre páginas)
+   ========================================================================= */
+function AppNav({ page, setPage, isMobile }){
+  const itens = [
+    { id:"3d", label:"Visualização 3D", icone:"\u{1F5FA}️" },
+    { id:"produtos", label:"Produtos", icone:"\u{1F4E6}" },
+    { id:"enderecos", label:"Endereços", icone:"\u{1F4CD}" },
+    { id:"relatorios", label:"Relatórios", icone:"\u{1F4CA}" }
+  ];
+  if(isMobile){
+    return h("div", { style:{ flex:"0 0 auto", display:"flex", overflowX:"auto",
+      background:"rgba(9,11,13,0.98)", borderBottom:"1px solid rgba(255,255,255,0.06)" } },
+      itens.map(it => h("button", { key:it.id, onClick:()=>setPage(it.id),
+        style:{ flex:"0 0 auto", display:"flex", alignItems:"center", gap:5, padding:"8px 12px",
+          background: page===it.id ? "rgba(142,207,245,0.14)" : "transparent",
+          color: page===it.id ? "#8ecff5" : "#a8a29a", border:"none",
+          borderBottom: page===it.id ? "2px solid #8ecff5" : "2px solid transparent",
+          fontSize:12, fontWeight:600, cursor:"pointer", whiteSpace:"nowrap" } },
+        it.icone, " ", it.label))
+    );
+  }
+  return h("div", { style:{ flex:"0 0 auto", width:168, display:"flex", flexDirection:"column",
+    background:"rgba(9,11,13,0.98)", borderRight:"1px solid rgba(255,255,255,0.06)", padding:"14px 10px" } },
+    h("div", { style:{ display:"flex", alignItems:"center", gap:8, padding:"0 6px 16px" } },
+      h("span", { style:{ fontSize:20 } }, "\u{1F4E6}"),
+      h("div", null,
+        h("div", { style:{ fontSize:13, fontWeight:700, color:"#f4efe6", fontFamily:"'JetBrains Mono', monospace" } }, "MAPA 3D"),
+        h("div", { style:{ fontSize:9.5, color:"#6b6f74" } }, "IMAGINAE"))
+    ),
+    itens.map(it => h("button", { key:it.id, onClick:()=>setPage(it.id),
+      style:{ display:"flex", alignItems:"center", gap:9, padding:"9px 10px", marginBottom:2, borderRadius:7,
+        background: page===it.id ? "rgba(142,207,245,0.14)" : "transparent",
+        color: page===it.id ? "#8ecff5" : "#a8a29a", border:"none", textAlign:"left",
+        fontSize:12.5, fontWeight:600, cursor:"pointer" } },
+      h("span", null, it.icone), h("span", null, it.label)))
+  );
+}
+
+/* =========================================================================
+   VISÃO 2D — grade rua x coluna com status agregado por posição, como
+   alternativa de leitura rápida à cena 3D (sobreposta ao canvas, mesma
+   página "Visualização 3D").
+   ========================================================================= */
+function Visao2DGrid({ grid2D, onSelectPos, isMobile }){
+  if(!grid2D) return null;
+  return h("div", { style:{ position:"absolute", inset:0, zIndex:11, background:"#15181b",
+    overflow:"auto", padding: isMobile ? "10px" : "16px 20px" } },
+    grid2D.length===0 && h("div", { style:{ color:"#a8a29a", fontSize:13 } }, "Nenhuma rua na faixa selecionada."),
+    h("div", { style:{ display:"inline-block", minWidth:"100%" } },
+      grid2D.map(({ rua, colunas })=> h("div", { key:rua, style:{ display:"flex", alignItems:"center", gap:6, marginBottom:3 } },
+        h("div", { style:{ width:52, flex:"0 0 auto", fontSize:11, fontWeight:700, color:"#8ecff5",
+          fontFamily:"'JetBrains Mono', monospace" } }, "RUA " + rua),
+        h("div", { style:{ display:"flex", gap:2 } },
+          colunas.map((c,i)=> h("div", {
+            key:i,
+            title: c.pos ? (c.pos + " — " + STATUS2D_LABELS[c.status] + " — " + c.itens + " lote(s)") : ("Coluna " + (i+1) + " — vazia"),
+            onClick: ()=> c.pos && onSelectPos(c.pos),
+            style:{ width: isMobile?13:16, height: isMobile?13:16, borderRadius:3,
+              background: STATUS2D_CORES[c.status], cursor: c.pos ? "pointer" : "default",
+              flex:"0 0 auto", opacity: c.pos ? 1 : 0.45 }
+          }))
+        )
+      ))
+    ),
+    h("div", { style:{ display:"flex", gap:14, flexWrap:"wrap", marginTop:16, paddingTop:12,
+      borderTop:"1px solid rgba(255,255,255,0.08)" } },
+      Object.keys(STATUS2D_CORES).map(k => h("div", { key:k, style:{ display:"flex", alignItems:"center", gap:5 } },
+        h("span", { style:{ width:12, height:12, borderRadius:3, background:STATUS2D_CORES[k] } }),
+        h("span", { style:{ fontSize:11, color:"#a8a29a" } }, STATUS2D_LABELS[k]))))
+  );
+}
+
+/* =========================================================================
+   PAINEL DE FILTROS AVANÇADOS — faixa de rua, nível e atalhos (reaproveita
+   os mesmos toggles de destaque já existentes no mapa 3D/Visão 2D).
+   ========================================================================= */
+function FiltrosAvancadosPanel({ open, onClose, isMobile, ruas, niveisDisponiveis,
+  filtroRuaDe, setFiltroRuaDe, filtroRuaAte, setFiltroRuaAte, filtroNivel, setFiltroNivel,
+  mode, toggleMode }){
+  if(!open) return null;
+  const btnNivel = (n)=> h("button", { key:String(n), onClick:()=>setFiltroNivel(filtroNivel===n ? null : n),
+    style:{ padding:"5px 10px", borderRadius:6, border:"1px solid rgba(255,255,255,0.15)",
+      background: filtroNivel===n ? "#2a6f77" : "rgba(255,255,255,0.06)",
+      color:"#f4efe6", fontSize:11.5, fontWeight:600, cursor:"pointer" } }, "Nível " + n);
+  return h("div", {
+    style:{ position:"absolute", top:0, left:0, width:240, maxWidth:"88vw", height:"100%",
+      background:"rgba(17,20,23,0.98)", color:"#f4efe6", padding:"18px 16px", overflowY:"auto",
+      boxShadow:"8px 0 24px rgba(0,0,0,0.4)", fontFamily:"'Inter', system-ui, sans-serif",
+      borderRight:"1px solid rgba(142,207,245,0.25)", zIndex:21, fontSize:12.5 }
+  },
+    h("div", { style:{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:14 } },
+      h("h2", { style:{ margin:0, fontSize:14, color:"#8ecff5" } }, "Filtros avançados"),
+      h("button", { onClick:onClose, style:{ background:"none", border:"none", color:"#a8a29a", fontSize:20, cursor:"pointer", lineHeight:1 } }, "\xD7")
+    ),
+
+    h("div", { style:{ marginBottom:16 } },
+      h("div", { style:{ fontWeight:700, marginBottom:6, color:"#a8a29a", fontSize:11, textTransform:"uppercase" } }, "Faixa de rua"),
+      h("div", { style:{ display:"flex", gap:6, alignItems:"center" } },
+        h("select", { value:filtroRuaDe, onChange:(e)=>setFiltroRuaDe(e.target.value),
+          style:{ flex:1, padding:"5px 6px", borderRadius:6, border:"1px solid rgba(255,255,255,0.15)",
+            background:"rgba(20,24,28,0.9)", color:"#f4efe6", fontSize:12 } },
+          h("option", { value:"" }, "de"),
+          ruas.map(r=> h("option", { key:r, value:r }, r))),
+        h("span", { style:{ color:"#6b6f74" } }, "→"),
+        h("select", { value:filtroRuaAte, onChange:(e)=>setFiltroRuaAte(e.target.value),
+          style:{ flex:1, padding:"5px 6px", borderRadius:6, border:"1px solid rgba(255,255,255,0.15)",
+            background:"rgba(20,24,28,0.9)", color:"#f4efe6", fontSize:12 } },
+          h("option", { value:"" }, "até"),
+          ruas.map(r=> h("option", { key:r, value:r }, r)))
+      ),
+      (filtroRuaDe || filtroRuaAte) && h("button", { onClick:()=>{ setFiltroRuaDe(""); setFiltroRuaAte(""); },
+        style:{ marginTop:6, padding:"3px 8px", borderRadius:5, border:"1px solid rgba(255,255,255,0.15)",
+          background:"transparent", color:"#6b6f74", fontSize:10.5, cursor:"pointer" } }, "Limpar faixa"),
+      h("div", { style:{ marginTop:4, fontSize:10, color:"#6b6f74" } },
+        "Aplica-se à Visão 2D e à barra de ruas — o mapa 3D sempre mostra o galpão inteiro, pra manter a referência espacial.")
+    ),
+
+    niveisDisponiveis.length>0 && h("div", { style:{ marginBottom:16 } },
+      h("div", { style:{ fontWeight:700, marginBottom:6, color:"#a8a29a", fontSize:11, textTransform:"uppercase" } }, "Nível"),
+      h("div", { style:{ display:"flex", gap:6, flexWrap:"wrap" } }, niveisDisponiveis.map(btnNivel))
+    ),
+
+    h("div", null,
+      h("div", { style:{ fontWeight:700, marginBottom:6, color:"#a8a29a", fontSize:11, textTransform:"uppercase" } }, "Atalhos"),
+      h("div", { style:{ display:"flex", flexDirection:"column", gap:6 } },
+        h("button", { onClick:()=>toggleMode("risco"), style:{ padding:"7px 10px", borderRadius:6, textAlign:"left",
+          border:"1px solid rgba(255,255,255,0.15)", background: mode.type==="risco" ? "rgba(232,161,58,0.25)" : "rgba(255,255,255,0.06)",
+          color:"#e8a13a", fontSize:12, fontWeight:600, cursor:"pointer" } }, "⚠ Vence em breve"),
+        h("button", { onClick:()=>toggleMode("vencido"), style:{ padding:"7px 10px", borderRadius:6, textAlign:"left",
+          border:"1px solid rgba(255,255,255,0.15)", background: mode.type==="vencido" ? "rgba(192,57,43,0.3)" : "rgba(255,255,255,0.06)",
+          color:"#ff8a80", fontSize:12, fontWeight:600, cursor:"pointer" } }, "⏰ Vencidos"),
+        h("button", { onClick:()=>toggleMode("danificado"), style:{ padding:"7px 10px", borderRadius:6, textAlign:"left",
+          border:"1px solid rgba(255,255,255,0.15)", background: mode.type==="danificado" ? "rgba(192,57,43,0.3)" : "rgba(255,255,255,0.06)",
+          color:"#ff8a80", fontSize:12, fontWeight:600, cursor:"pointer" } }, "❗ Danificados"),
+        h("button", { onClick:()=>toggleMode("vazio"), style:{ padding:"7px 10px", borderRadius:6, textAlign:"left",
+          border:"1px solid rgba(255,255,255,0.15)", background: mode.type==="vazio" ? "rgba(42,157,143,0.3)" : "rgba(255,255,255,0.06)",
+          color:"#2a9d8f", fontSize:12, fontWeight:600, cursor:"pointer" } }, "▢ Vazias")
+      )
+    )
+  );
+}
+
+/* =========================================================================
+   PÁGINA: PRODUTOS — agrega por código (SKU), mostrando posições, qtd
+   total e valor total (valorUnitario x qtde, quando a planilha trouxer).
+   ========================================================================= */
+function PaginaProdutos({ data, isMobile }){
+  const [busca, setBusca] = useState("");
+  const [paginaProd, setPaginaProd] = useState(0);
+  const porPaginaProd = 60;
+
+  const produtosTodos = useMemo(()=>{
+    const map = new Map();
+    (data||[]).forEach(p=>{
+      p.itens.forEach(it=>{
+        const obj = itemToObj(it);
+        const cod = obj.codigo || "(sem código)";
+        if(!map.has(cod)) map.set(cod, { codigo:cod, desc:obj.desc, familia:obj.familia, qtde:0, valor:0, posicoes:new Set() });
+        const r = map.get(cod);
+        r.qtde += Number(obj.qtde)||0;
+        r.valor += (Number(obj.qtde)||0) * (Number(obj.valorUnitario)||0);
+        r.posicoes.add(p.pos);
+      });
+    });
+    return Array.from(map.values()).sort((a,b)=>b.qtde-a.qtde);
+  }, [data]);
+
+  const produtosFiltrados = useMemo(()=>{
+    const termo = busca.trim().toLowerCase();
+    if(!termo) return produtosTodos;
+    return produtosTodos.filter(pr =>
+      (pr.codigo||"").toLowerCase().includes(termo) ||
+      (pr.desc||"").toLowerCase().includes(termo) ||
+      (pr.familia||"").toLowerCase().includes(termo));
+  }, [produtosTodos, busca]);
+
+  const totalPaginasProd = Math.max(1, Math.ceil(produtosFiltrados.length/porPaginaProd));
+  const paginaProdAtual = Math.min(paginaProd, totalPaginasProd-1);
+  const produtos = produtosFiltrados.slice(paginaProdAtual*porPaginaProd, paginaProdAtual*porPaginaProd+porPaginaProd);
+
+  return h("div", { style:{ flex:"1 1 auto", overflow:"auto", padding: isMobile?"14px":"20px" } },
+    h("h2", { style:{ margin:"0 0 4px", fontSize:16, color:"#f4efe6" } }, "Produtos armazenados"),
+    h("div", { style:{ display:"flex", justifyContent:"space-between", alignItems:"center", flexWrap:"wrap", gap:8, marginBottom:14 } },
+      h("p", { style:{ margin:0, fontSize:12, color:"#a8a29a" } },
+        produtosFiltrados.length.toLocaleString("pt-BR"), " SKU(s)",
+        busca ? " encontrados · " + produtosTodos.length.toLocaleString("pt-BR") + " no total" : " ativos",
+        " · página ", paginaProdAtual+1, "/", totalPaginasProd),
+      h("div", { style:{ display:"flex", gap:6, alignItems:"center" } },
+        h("input", { type:"text", placeholder:"Buscar por código, descrição ou família...", value:busca,
+          onChange:(e)=>{ setBusca(e.target.value); setPaginaProd(0); },
+          style:{ padding:"6px 10px", borderRadius:6, border:"1px solid rgba(255,255,255,0.15)",
+            background:"rgba(20,24,28,0.9)", color:"#f4efe6", fontSize:12, outline:"none", width: isMobile?140:220 } }),
+        h("button", { onClick:()=>setPaginaProd(p=>Math.max(0,p-1)), disabled:paginaProdAtual===0,
+          style:{ padding:"5px 10px", borderRadius:6, border:"1px solid rgba(255,255,255,0.15)", background:"rgba(255,255,255,0.06)",
+            color:"#f4efe6", fontSize:12, cursor: paginaProdAtual===0?"default":"pointer", opacity: paginaProdAtual===0?0.5:1 } }, "←"),
+        h("button", { onClick:()=>setPaginaProd(p=>Math.min(totalPaginasProd-1,p+1)), disabled:paginaProdAtual>=totalPaginasProd-1,
+          style:{ padding:"5px 10px", borderRadius:6, border:"1px solid rgba(255,255,255,0.15)", background:"rgba(255,255,255,0.06)",
+            color:"#f4efe6", fontSize:12, cursor: paginaProdAtual>=totalPaginasProd-1?"default":"pointer", opacity: paginaProdAtual>=totalPaginasProd-1?0.5:1 } }, "→")
+      )
+    ),
+    h("div", { style:{ display:"grid", gridTemplateColumns: isMobile ? "1fr" : "repeat(auto-fill, minmax(260px, 1fr))", gap:12 } },
+      produtos.map(pr => h("div", { key:pr.codigo, style:{ background:"rgba(255,255,255,0.04)",
+          border:"1px solid rgba(255,255,255,0.08)", borderRadius:10, padding:"14px 16px" } },
+        h("div", { style:{ fontWeight:700, color:"#f4efe6", fontSize:13, marginBottom:2, lineHeight:1.3 } }, pr.desc || pr.codigo),
+        h("div", { style:{ fontSize:11, color:"#6b6f74", fontFamily:"'JetBrains Mono', monospace", marginBottom:10 } },
+          pr.codigo, pr.familia ? " \xB7 " + pr.familia : ""),
+        h("div", { style:{ display:"flex", justifyContent:"space-between", fontSize:11.5, padding:"3px 0", borderTop:"1px solid rgba(255,255,255,0.06)" } },
+          h("span", { style:{ color:"#a8a29a" } }, "Posições"), h("strong", null, pr.posicoes.size.toLocaleString("pt-BR"))),
+        h("div", { style:{ display:"flex", justifyContent:"space-between", fontSize:11.5, padding:"3px 0" } },
+          h("span", { style:{ color:"#a8a29a" } }, "Quantidade"), h("strong", null, pr.qtde.toLocaleString("pt-BR"))),
+        pr.valor>0 && h("div", { style:{ display:"flex", justifyContent:"space-between", fontSize:11.5, padding:"3px 0" } },
+          h("span", { style:{ color:"#a8a29a" } }, "Valor total"),
+          h("strong", { style:{ color:"#7fd99a" } }, "R$ " + pr.valor.toLocaleString("pt-BR", { maximumFractionDigits:0 })))
+      ))
+    )
+  );
+}
+
+/* =========================================================================
+   PÁGINA: ENDEREÇOS — tabela paginada de todas as posições.
+   ========================================================================= */
+function PaginaEnderecos({ data, onSelectPos, isMobile }){
+  const [pagina, setPagina] = useState(0);
+  const porPagina = 50;
+  const linhas = useMemo(()=> (data||[]).slice().sort((a,b)=> a.pos.localeCompare(b.pos, "pt-BR", { numeric:true })), [data]);
+  const totalPaginas = Math.max(1, Math.ceil(linhas.length/porPagina));
+  const paginaAtual = Math.min(pagina, totalPaginas-1);
+  const visiveis = linhas.slice(paginaAtual*porPagina, paginaAtual*porPagina+porPagina);
+
+  return h("div", { style:{ flex:"1 1 auto", overflow:"auto", padding: isMobile?"14px":"20px" } },
+    h("div", { style:{ display:"flex", justifyContent:"space-between", alignItems:"baseline", flexWrap:"wrap", gap:8, marginBottom:10 } },
+      h("div", null,
+        h("h2", { style:{ margin:"0 0 4px", fontSize:16, color:"#f4efe6" } }, "Endereços de estoque"),
+        h("p", { style:{ margin:0, fontSize:12, color:"#a8a29a" } }, linhas.length.toLocaleString("pt-BR"), " endereços \xB7 página ", paginaAtual+1, "/", totalPaginas)),
+      h("div", { style:{ display:"flex", gap:6 } },
+        h("button", { onClick:()=>setPagina(p=>Math.max(0,p-1)), disabled:paginaAtual===0,
+          style:{ padding:"5px 10px", borderRadius:6, border:"1px solid rgba(255,255,255,0.15)", background:"rgba(255,255,255,0.06)",
+            color:"#f4efe6", fontSize:12, cursor: paginaAtual===0?"default":"pointer", opacity: paginaAtual===0?0.5:1 } }, "← Anterior"),
+        h("button", { onClick:()=>setPagina(p=>Math.min(totalPaginas-1,p+1)), disabled:paginaAtual>=totalPaginas-1,
+          style:{ padding:"5px 10px", borderRadius:6, border:"1px solid rgba(255,255,255,0.15)", background:"rgba(255,255,255,0.06)",
+            color:"#f4efe6", fontSize:12, cursor: paginaAtual>=totalPaginas-1?"default":"pointer", opacity: paginaAtual>=totalPaginas-1?0.5:1 } }, "Próximo →")
+      )
+    ),
+    h("div", { style:{ overflowX:"auto", border:"1px solid rgba(255,255,255,0.08)", borderRadius:8 } },
+      h("table", { style:{ width:"100%", borderCollapse:"collapse", fontSize:12 } },
+        h("thead", null, h("tr", { style:{ background:"rgba(255,255,255,0.04)", color:"#a8a29a", textAlign:"left" } },
+          ["Endereço","Rua","Col","Nv","Status","Produto principal","Itens"].map(c=>
+            h("th", { key:c, style:{ padding:"8px 10px", fontWeight:600, fontSize:11, textTransform:"uppercase" } }, c)))),
+        h("tbody", null, visiveis.map(p=>{
+          const ocupado = p.itens.length>0;
+          const principal = ocupado ? itemToObj(p.itens[0]).desc : "—";
+          return h("tr", { key:p.pos, onClick:()=>onSelectPos(p.pos), style:{ borderTop:"1px solid rgba(255,255,255,0.06)", cursor:"pointer" } },
+            h("td", { style:{ padding:"7px 10px", fontFamily:"'JetBrains Mono', monospace", color:"#e8a13a" } }, p.pos),
+            h("td", { style:{ padding:"7px 10px", color:"#f4efe6" } }, p.rua),
+            h("td", { style:{ padding:"7px 10px", color:"#f4efe6" } }, p.col),
+            h("td", { style:{ padding:"7px 10px", color:"#f4efe6" } }, p.niv),
+            h("td", { style:{ padding:"7px 10px" } }, h("span", { style:{ fontSize:10, fontWeight:700, padding:"2px 7px",
+              borderRadius:4, background: ocupado ? "rgba(46,139,87,0.25)" : "rgba(255,255,255,0.08)",
+              color: ocupado ? "#7fd99a" : "#a8a29a" } }, ocupado ? "OCUPADO" : "VAZIO")),
+            h("td", { style:{ padding:"7px 10px", color:"#a8a29a", maxWidth:260, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" } }, principal),
+            h("td", { style:{ padding:"7px 10px", color:"#f4efe6" } }, p.itens.length)
+          );
+        }))
+      )
+    )
+  );
+}
+
+/* =========================================================================
+   PÁGINA: RELATÓRIOS — agregações reais sobre o snapshot atual dos dados.
+   Não existe histórico (o app não guarda posições anteriores), então não
+   há "evolução no tempo" aqui — só cortes do estado atual, honestamente.
+   ========================================================================= */
+function BarraHorizontal({ label, valor, max, cor }){
+  const pct = max>0 ? Math.max(2, Math.round(valor/max*100)) : 0;
+  return h("div", { style:{ marginBottom:9 } },
+    h("div", { style:{ display:"flex", justifyContent:"space-between", fontSize:11.5, marginBottom:3 } },
+      h("span", { style:{ color:"#a8a29a" } }, label), h("strong", { style:{ color:"#f4efe6" } }, valor.toLocaleString("pt-BR"))),
+    h("div", { style:{ height:7, borderRadius:4, background:"rgba(255,255,255,0.06)", overflow:"hidden" } },
+      h("div", { style:{ width:pct+"%", height:"100%", background:cor } }))
+  );
+}
+function PaginaRelatorios({ data, kpis, isMobile }){
+  const porFamilia = useMemo(()=>{
+    const map = new Map();
+    (data||[]).forEach(p=>p.itens.forEach(it=>{
+      const fam = itemToObj(it).familia || "(sem família)";
+      map.set(fam, (map.get(fam)||0)+1);
+    }));
+    return Array.from(map.entries()).map(([k,v])=>({ label:k, valor:v })).sort((a,b)=>b.valor-a.valor);
+  }, [data]);
+
+  const topProdutos = useMemo(()=>{
+    const map = new Map();
+    (data||[]).forEach(p=>p.itens.forEach(it=>{
+      const obj = itemToObj(it);
+      const key = obj.codigo || obj.desc;
+      if(!map.has(key)) map.set(key, { label: obj.desc || obj.codigo, valor:0 });
+      map.get(key).valor += Number(obj.qtde)||0;
+    }));
+    return Array.from(map.values()).sort((a,b)=>b.valor-a.valor).slice(0,10);
+  }, [data]);
+
+  const maxFamilia = porFamilia.length ? porFamilia[0].valor : 0;
+  const maxProduto = topProdutos.length ? topProdutos[0].valor : 0;
+
+  return h("div", { style:{ flex:"1 1 auto", overflow:"auto", padding: isMobile?"14px":"20px" } },
+    h("h2", { style:{ margin:"0 0 4px", fontSize:16, color:"#f4efe6" } }, "Relatórios"),
+    h("p", { style:{ margin:"0 0 16px", fontSize:11.5, color:"#6b6f74" } },
+      "Cortes sobre o snapshot atual do estoque — o app não guarda histórico entre importações, então não há gráfico de evolução no tempo."),
+
+    h("div", { style:{ display:"grid", gridTemplateColumns: isMobile ? "1fr" : "1fr 1fr", gap:16 } },
+
+      kpis && h("div", { style:{ background:"rgba(255,255,255,0.04)", border:"1px solid rgba(255,255,255,0.08)", borderRadius:10, padding:"16px 18px" } },
+        h("div", { style:{ fontWeight:700, marginBottom:12, color:"#f4efe6", fontSize:13 } }, "Distribuição por status"),
+        BarraHorizontal({ label:"Ocupados", valor:kpis.ocupadas, max:kpis.capacidade, cor:STATUS2D_CORES.ocupado }),
+        BarraHorizontal({ label:"Vazios", valor:kpis.vazias, max:kpis.capacidade, cor:STATUS2D_CORES.vazio }),
+        BarraHorizontal({ label:"Vencidos", valor:kpis.vencidas, max:kpis.capacidade, cor:STATUS2D_CORES.vencido }),
+        BarraHorizontal({ label:"A vencer ≤15d", valor:kpis.aVencer, max:kpis.capacidade, cor:STATUS2D_CORES.aVencer }),
+        BarraHorizontal({ label:"Danificados", valor:kpis.danificadas, max:kpis.capacidade, cor:STATUS2D_CORES.danificado })
+      ),
+
+      h("div", { style:{ background:"rgba(255,255,255,0.04)", border:"1px solid rgba(255,255,255,0.08)", borderRadius:10, padding:"16px 18px" } },
+        h("div", { style:{ fontWeight:700, marginBottom:12, color:"#f4efe6", fontSize:13 } }, "Itens por família"),
+        porFamilia.slice(0,10).map(f => h(React.Fragment, { key:f.label },
+          BarraHorizontal({ label:f.label, valor:f.valor, max:maxFamilia, cor:"#8ecff5" })))
+      ),
+
+      h("div", { style:{ background:"rgba(255,255,255,0.04)", border:"1px solid rgba(255,255,255,0.08)", borderRadius:10, padding:"16px 18px", gridColumn: isMobile ? "auto" : "1 / span 2" } },
+        h("div", { style:{ fontWeight:700, marginBottom:12, color:"#f4efe6", fontSize:13 } }, "Produtos mais armazenados (por quantidade)"),
+        topProdutos.map(p => h(React.Fragment, { key:p.label },
+          BarraHorizontal({ label:p.label, valor:p.valor, max:maxProduto, cor:"#e8a13a" })))
+      )
+    )
+  );
+}
+
+/* =========================================================================
    COMPONENTE PRINCIPAL
    ========================================================================= */
+const PaginaFn = { produtos: PaginaProdutos, enderecos: PaginaEnderecos, relatorios: PaginaRelatorios };
+
 function Armazem3D(){
   const mountRef = useRef(null);
   const api = useRef({}); // "ponte" entre React e a cena Three.js
@@ -899,6 +964,16 @@ function Armazem3D(){
   // painel com dados reais do prédio (fonte: projeto de Vigilância Sanitária PMB 059627/2026)
   const [infoOpen, setInfoOpen] = useState(false);
 
+  // --- navegação do app (páginas, tipo o menu lateral de referência) ---
+  const [page, setPage] = useState("3d"); // "3d" | "produtos" | "enderecos" | "relatorios"
+  // --- Visão 2D (grade rua x coluna) sobreposta à Visão 3D, mesma página ---
+  const [visao2D, setVisao2D] = useState(false);
+  // --- painel de filtros avançados (faixa de rua, nível) ---
+  const [filtrosAvOpen, setFiltrosAvOpen] = useState(false);
+  const [filtroRuaDe, setFiltroRuaDe] = useState("");
+  const [filtroRuaAte, setFiltroRuaAte] = useState("");
+  const [filtroNivel, setFiltroNivel] = useState(null); // null = todos
+
   // --- responsivo: detecta tela pequena (celular) para adaptar o layout ---
   const [isMobile, setIsMobile] = useState(()=> typeof window !== "undefined" && window.innerWidth <= 760);
   const [filtersOpen, setFiltersOpen] = useState(false); // no celular, filtros ficam recolhidos por padrão
@@ -915,93 +990,10 @@ function Armazem3D(){
       const positions = await readErpFile(file);
       const totalItens = positions.reduce((acc,p)=>acc+p.itens.length, 0);
       setError(null);
-      setData(positions);
+      setData(annotatePositions(positions));
       setImportStatus({ state:"success", posCount:positions.length, itemCount:totalItens, at:new Date() });
-      // atualizou a planilha? a IA já reestuda os dados na hora sozinha,
-      // sem precisar clicar em nada (usa 'positions' direto, não o estado
-      // 'data' — que ainda não teria atualizado nesse exato instante)
-      if(geminiKey) gerarAnalise(positions);
     }catch(e){
       setImportStatus({ state:"error", message: e.message || String(e) });
-    }
-  };
-
-  // --- IA do estoque (Gemini) ---
-  const [geminiKey, setGeminiKey] = useState(()=>{
-    try{ return localStorage.getItem("gemini_api_key") || ""; }catch(e){ return ""; }
-  });
-  const [geminiKeyInput, setGeminiKeyInput] = useState("");
-  const [chatOpen, setChatOpen] = useState(false);
-  // histórico do chat persiste no navegador (localStorage) — assim ele
-  // "lembra" da conversa mesmo depois de fechar e reabrir a aba
-  const [chatMessages, setChatMessages] = useState(()=>{
-    try{ return JSON.parse(localStorage.getItem("estoque_chat_historico")||"[]"); }catch(e){ return []; }
-  }); // { role:"user"|"ia"|"erro", text, model? }
-  const [chatInput, setChatInput] = useState("");
-  const [chatLoading, setChatLoading] = useState(false);
-
-  useEffect(()=>{
-    try{ localStorage.setItem("estoque_chat_historico", JSON.stringify(chatMessages.slice(-60))); }catch(e){}
-  }, [chatMessages]);
-  const limparConversa = ()=>{
-    setChatMessages([]);
-    try{ localStorage.removeItem("estoque_chat_historico"); }catch(e){}
-  };
-
-  // --- Análise Inteligente (diagnóstico automático, não é chat) ---
-  const [analiseOpen, setAnaliseOpen] = useState(false);
-  const [analise, setAnalise] = useState(()=>{
-    try{ return JSON.parse(localStorage.getItem("estoque_analise_ia")||"null"); }catch(e){ return null; }
-  }); // { resumoExecutivo, riscosCriticos[], oportunidades[], anomalias[], recomendacoes[], geradaEm, model }
-  const [analiseLoading, setAnaliseLoading] = useState(false);
-  const [analiseErro, setAnaliseErro] = useState(null);
-  const gerarAnalise = async (dadosOverride)=>{
-    const dadosParaAnalise = dadosOverride || data;
-    if(!geminiKey || analiseLoading || !dadosParaAnalise) return;
-    setAnaliseLoading(true);
-    setAnaliseErro(null);
-    try{
-      const summary = buildEstoqueSummary(dadosParaAnalise);
-      const { analise: resultado, model } = await gerarAnaliseCompletaIA(geminiKey, summary);
-      const comMeta = { ...resultado, geradaEm: new Date().toISOString(), model };
-      setAnalise(comMeta);
-      try{ localStorage.setItem("estoque_analise_ia", JSON.stringify(comMeta)); }catch(e){}
-    }catch(e){
-      setAnaliseErro(e.message || String(e));
-    }finally{
-      setAnaliseLoading(false);
-    }
-  };
-
-  const saveGeminiKey = ()=>{
-    const k = geminiKeyInput.trim();
-    if(!k) return;
-    setGeminiKey(k);
-    try{ localStorage.setItem("gemini_api_key", k); }catch(e){}
-    setGeminiKeyInput("");
-  };
-  const forgetGeminiKey = ()=>{
-    setGeminiKey("");
-    try{ localStorage.removeItem("gemini_api_key"); }catch(e){}
-  };
-  const sendChatMessage = async ()=>{
-    const q = chatInput.trim();
-    if(!q || !geminiKey || chatLoading || !data) return;
-    setChatMessages(m=>[...m, { role:"user", text:q }]);
-    setChatInput("");
-    setChatLoading(true);
-    try{
-      const summary = buildEstoqueSummary(data);
-      const slice = findRelevantSlice(data, q);
-      // manda uma janela maior de histórico agora que ele persiste entre
-      // sessões — dá mais contexto de continuidade pra IA
-      const historico = chatMessages.slice(-16).filter(m=>m.role==="user" || m.role==="ia");
-      const { text, model } = await askGeminiSobreEstoque(geminiKey, q, summary, slice, historico, analise);
-      setChatMessages(m=>[...m, { role:"ia", text, model }]);
-    }catch(e){
-      setChatMessages(m=>[...m, { role:"erro", text: e.message || String(e) }]);
-    }finally{
-      setChatLoading(false);
     }
   };
 
@@ -1015,7 +1007,7 @@ function Armazem3D(){
         const total = len ? parseInt(len,10) : 0;
         if(!res.body || !total){
           const json = await res.json();
-          if(!cancelled) setData(json);
+          if(!cancelled) setData(annotatePositions(json));
           return;
         }
         const reader = res.body.getReader();
@@ -1030,7 +1022,7 @@ function Armazem3D(){
         }
         const text = await new Blob(chunks).text();
         const json = JSON.parse(text);
-        if(!cancelled){ setProgress(100); setData(json); }
+        if(!cancelled){ setProgress(100); setData(annotatePositions(json)); }
       }catch(e){
         if(!cancelled) setError(e.message);
       }
@@ -1072,6 +1064,82 @@ function Armazem3D(){
   }, [mainLayout]);
 
   const ruasLotadas = useMemo(()=> Object.values(ocupacaoPorRua).filter(o=>o.pct>=0.85).length, [ocupacaoPorRua]);
+
+  // KPIs de topo (estilo "barra de indicadores"): capacidade real da grade
+  // (maxCol x maxNiv observados por rua), ocupadas, vazias, % ocupação e
+  // contagem de posições com item vencido / a vencer / danificado.
+  const kpis = useMemo(()=>{
+    if(!mainLayout) return null;
+    const capacidade = mainLayout.ruas.reduce((acc,r)=>
+      acc + (mainLayout.maxColByRua[r]||0) * (mainLayout.maxLevelByRua[r]||0), 0);
+    const ocupadas = mainLayout.positions.length;
+    const vazias = Math.max(0, capacidade - ocupadas);
+    const hoje = new Date(); hoje.setHours(0,0,0,0);
+    let vencidas = 0, aVencer = 0, danificadas = 0;
+    mainLayout.positions.forEach(p=>{
+      const risco = riscoValidadePosicao(p.itens, hoje);
+      if(risco === "vencido") vencidas++;
+      else if(risco === "critico" || risco === "atencao") aVencer++;
+      if(p.itens.some(it=>isTruthy(it[8]))) danificadas++;
+    });
+    return { capacidade, ocupadas, vazias,
+      pctOcupacao: capacidade>0 ? Math.round(ocupadas/capacidade*100) : 0,
+      vencidas, aVencer, danificadas };
+  }, [mainLayout]);
+
+  // níveis reais existentes no galpão (pra montar os botões de filtro "Nível")
+  const niveisDisponiveis = useMemo(()=>{
+    if(!mainLayout) return [];
+    const set = new Set();
+    mainLayout.positions.forEach(p=>set.add(p.niv));
+    return Array.from(set).sort((a,b)=>a-b);
+  }, [mainLayout]);
+
+  // ruas dentro da faixa "de/até" escolhida no painel de filtros avançados
+  // (quando vazio, considera o galpão inteiro) — usado pela Visão 2D e,
+  // futuramente, por outras listas que precisem respeitar esse recorte.
+  const ruasFiltradas = useMemo(()=>{
+    if(!mainLayout) return [];
+    if(!filtroRuaDe && !filtroRuaAte) return mainLayout.ruas;
+    const idxDe = filtroRuaDe ? mainLayout.ruas.indexOf(filtroRuaDe) : 0;
+    const idxAte = filtroRuaAte ? mainLayout.ruas.indexOf(filtroRuaAte) : mainLayout.ruas.length-1;
+    const lo = Math.max(0, Math.min(idxDe, idxAte));
+    const hi = Math.max(idxDe, idxAte);
+    return mainLayout.ruas.slice(lo, hi+1);
+  }, [mainLayout, filtroRuaDe, filtroRuaAte]);
+
+  // grade da Visão 2D: status agregado por (rua, coluna), respeitando a
+  // faixa de rua e o filtro de nível do painel de filtros avançados.
+  // Prioridade de cor quando a coluna tem mais de um status: vencido >
+  // danificado > a vencer (≤15d) > ocupado > vazio.
+  const grid2D = useMemo(()=>{
+    if(!mainLayout || !visao2D) return null;
+    const hoje = new Date(); hoje.setHours(0,0,0,0);
+    const ordemStatus = { vencido:5, danificado:4, aVencer:3, ocupado:2, vazio:1 };
+    return ruasFiltradas.map(rua=>{
+      const maxCol = mainLayout.maxColByRua[rua] || 0;
+      const porColuna = new Map();
+      mainLayout.positions.forEach(p=>{
+        if(p.rua !== rua) return;
+        if(filtroNivel!=null && p.niv !== filtroNivel) return;
+        const risco = riscoValidadePosicao(p.itens, hoje);
+        const danificado = p.itens.some(it=>isTruthy(it[8]));
+        let status = "ocupado";
+        if(risco==="vencido") status = "vencido";
+        else if(danificado) status = "danificado";
+        else if(risco==="critico" || risco==="atencao") status = "aVencer";
+        const atual = porColuna.get(p.col);
+        if(!atual || ordemStatus[status] > ordemStatus[atual.status]){
+          porColuna.set(p.col, { status, pos:p.pos, itens:p.itens.length });
+        }
+      });
+      const colunas = [];
+      for(let c=1; c<=maxCol; c++){
+        colunas.push(porColuna.get(c) || { status:"vazio", pos:null, itens:0 });
+      }
+      return { rua, colunas };
+    });
+  }, [mainLayout, ruasFiltradas, filtroNivel, visao2D]);
 
   const clientes = useMemo(()=>{
     if(!data) return [];
@@ -1125,6 +1193,17 @@ function Armazem3D(){
     setSelected(pos);
     api.current.focusCamera && api.current.focusCamera(pos);
   }, []);
+  // usado pelas páginas Endereços/Produtos e pela Visão 2D, que só têm a
+  // string do endereço (ex.: "15.49.1B") — acha o objeto completo em `data`,
+  // volta pra página "Visualização 3D" e foca a câmera nele.
+  const selectPosByString = useCallback((posStr)=>{
+    const obj = data && data.find(p=>p.pos===posStr);
+    if(!obj) return;
+    setPage("3d");
+    setVisao2D(false);
+    setSelected(obj);
+    api.current.focusCamera && api.current.focusCamera(obj);
+  }, [data]);
   const jumpToRua = useCallback((rua)=>{
     api.current.jumpToRua && api.current.jumpToRua(rua);
   }, []);
@@ -1133,6 +1212,15 @@ function Armazem3D(){
   }, []);
   const resetView = useCallback(()=>{
     api.current.resetView && api.current.resetView();
+  }, []);
+  const viewSuperior = useCallback(()=>{
+    api.current.viewSuperior && api.current.viewSuperior();
+  }, []);
+  const viewFrontal = useCallback(()=>{
+    api.current.viewFrontal && api.current.viewFrontal();
+  }, []);
+  const viewLateral = useCallback(()=>{
+    api.current.viewLateral && api.current.viewLateral();
   }, []);
 
   const toggleMode = useCallback((type)=>{
@@ -1945,6 +2033,35 @@ function Armazem3D(){
       syncCameraTargets();
       setViewMode("orbit");
     };
+    // "Frontal" é a mesma câmera de resetView (visão padrão, de frente pro
+    // galpão) — mantido como alias pra oferecer os 3 presets de câmera
+    // (Superior/Frontal/Lateral) de forma consistente na barra de botões.
+    api.current.viewFrontal = ()=> api.current.resetView();
+    // câmera vertical, olhando o galpão de cima (planta baixa) — útil pra
+    // ver a disposição geral das ruas de uma vez, como na "Visão 2D" de
+    // referência, mas ainda dentro da cena 3D (sem trocar de modo de visão).
+    api.current.viewSuperior = ()=>{
+      const overviewX = mainLayout.totalWidth/2 - mainLayout.corridorSpanX/2;
+      const overviewZ = mainLayout.totalDepth/2;
+      orbitTarget.set(overviewX, 0, overviewZ);
+      spherical.radius = clamp(Math.max(mainLayout.totalWidth, mainLayout.totalDepth)*0.78 + 14, initialRadius, maxOrbitRadius);
+      spherical.theta = Math.PI/2;
+      spherical.phi = 0.12; // quase direto de cima, evitando o gimbal lock em phi=0
+      syncCameraTargets();
+      setViewMode("orbit");
+    };
+    // câmera lateral, olhando o galpão de lado (perpendicular às ruas) —
+    // dá pra ver a profundidade/comprimento das ruas de uma vez.
+    api.current.viewLateral = ()=>{
+      const overviewX = mainLayout.totalWidth/2 - mainLayout.corridorSpanX/2;
+      const overviewZ = Math.min(10, mainLayout.totalDepth*0.12);
+      orbitTarget.set(overviewX, 3, overviewZ);
+      spherical.radius = clamp(mainLayout.totalWidth*0.8 + 22, initialRadius, maxOrbitRadius);
+      spherical.theta = Math.PI/2;
+      spherical.phi = Math.PI/2.4;
+      syncCameraTargets();
+      setViewMode("orbit");
+    };
 
     // Sempre que o modo "Andar" é ativado, a câmera passa a olhar para o
     // MEIO da faixa de posições (não para um lugar aleatório da cena).
@@ -2114,8 +2231,12 @@ function Armazem3D(){
   const inputBaseStyle = { padding:"6px 10px", borderRadius:6, border:"1px solid rgba(255,255,255,0.15)",
     background:"rgba(20,24,28,0.9)", color:"#f4efe6", fontSize:12, outline:"none" };
 
-  return h("div", { style:{ width:"100%", height:"100vh", display:"flex", flexDirection:"column",
+  return h("div", { style:{ width:"100%", height:"100vh", display:"flex", flexDirection: isMobile ? "column" : "row",
     background:"#0d1013", fontFamily:"'Inter', system-ui, sans-serif", overflow:"hidden" } },
+
+    h(AppNav, { page, setPage, isMobile }),
+
+    h("div", { style:{ flex:"1 1 auto", minWidth:0, minHeight:0, display:"flex", flexDirection:"column", height:"100%" } },
 
     // --- barra superior (fica no fluxo normal da página: nunca sobrepõe o resto) ---
     h("div", { style:{ flex:"0 0 auto", display:"flex", justifyContent:"space-between", alignItems:"flex-start",
@@ -2184,21 +2305,57 @@ function Armazem3D(){
         )
       ),
 
-      h("div", { style:{ display:"flex", gap:6, flexWrap:"wrap" } },
+      page==="3d" && h("div", { style:{ display:"flex", gap:6, flexWrap:"wrap" } },
         h("button", { onClick:()=>setInfoOpen(o=>!o), style:{ background: infoOpen ? "#2a6f77" : "rgba(255,255,255,0.08)",
           color:"#8ecff5", border:"none", borderRadius:6, padding:"6px 12px", fontSize:12, fontWeight:600, cursor:"pointer" } }, "\u2139\uFE0F Dados do galpão"),
-        h("button", { onClick:()=>setAnaliseOpen(o=>!o), style:{ background: analiseOpen ? "#c9781f" : "rgba(255,255,255,0.08)",
-          color: analiseOpen ? "#1c1408" : "#e8a13a", border:"none", borderRadius:6, padding:"6px 12px", fontSize:12, fontWeight:600, cursor:"pointer" } }, "\u{1F9E0} Análise IA"),
-        h("button", { onClick: resetView, style:{ background:"rgba(255,255,255,0.08)", color:"#f4efe6", border:"none",
+        h("button", { onClick:()=>setFiltrosAvOpen(o=>!o), style:{ background: filtrosAvOpen ? "#2a6f77" : "rgba(255,255,255,0.08)",
+          color:"#f4efe6", border:"none", borderRadius:6, padding:"6px 12px", fontSize:12, fontWeight:600, cursor:"pointer" } }, "\u2630 Filtros avançados"),
+        h("button", { onClick: resetView, title:"Visão geral (padrão)", style:{ background:"rgba(255,255,255,0.08)", color:"#f4efe6", border:"none",
           borderRadius:6, padding:"6px 12px", fontSize:12, fontWeight:600, cursor:"pointer" } }, "\u{1F3E0} Visão geral"),
+        h("div", { style:{ display:"flex", borderRadius:6, overflow:"hidden", border:"1px solid rgba(255,255,255,0.12)" } },
+          h("button", { onClick: viewSuperior, title:"Câmera de cima (planta)", style:{ background:"rgba(255,255,255,0.08)",
+            color:"#f4efe6", border:"none", padding:"6px 10px", fontSize:11.5, fontWeight:600, cursor:"pointer" } }, "Superior"),
+          h("button", { onClick: viewFrontal, title:"Câmera de frente pro galpão", style:{ background:"rgba(255,255,255,0.08)",
+            color:"#f4efe6", border:"none", borderLeft:"1px solid rgba(255,255,255,0.12)", padding:"6px 10px", fontSize:11.5, fontWeight:600, cursor:"pointer" } }, "Frontal"),
+          h("button", { onClick: viewLateral, title:"Câmera de lado, olhando o comprimento das ruas", style:{ background:"rgba(255,255,255,0.08)",
+            color:"#f4efe6", border:"none", borderLeft:"1px solid rgba(255,255,255,0.12)", padding:"6px 10px", fontSize:11.5, fontWeight:600, cursor:"pointer" } }, "Lateral")
+        ),
+        h("div", { style:{ display:"flex", borderRadius:6, overflow:"hidden", border:"1px solid rgba(255,255,255,0.12)" } },
+          h("button", { onClick:()=>setVisao2D(false), style:{ background: !visao2D ? "#2a6f77" : "rgba(255,255,255,0.08)",
+            color:"#f4efe6", border:"none", padding:"6px 10px", fontSize:11.5, fontWeight:600, cursor:"pointer" } }, "Visão 3D"),
+          h("button", { onClick:()=>setVisao2D(true), style:{ background: visao2D ? "#2a6f77" : "rgba(255,255,255,0.08)",
+            color:"#f4efe6", border:"none", borderLeft:"1px solid rgba(255,255,255,0.12)", padding:"6px 10px", fontSize:11.5, fontWeight:600, cursor:"pointer" } }, "Visão 2D")
+        ),
         [["orbit","\u{1F5B1}\uFE0F Órbita"], ["walk","\u{1F6B6} Andar"]].map(([m,label]) =>
           h("button", { key:m, onClick:()=>setViewMode(m), style:{ background: viewMode===m ? "#2a6f77" : "rgba(255,255,255,0.08)",
             color:"#f4efe6", border:"none", borderRadius:6, padding:"6px 12px", fontSize:12, fontWeight:600, cursor:"pointer" } }, label))
       )
     ),
 
+    // --- barra de KPIs (indicadores gerais do galpão, sempre sobre os dados atuais) ---
+    kpis && h("div", { style:{ flex:"0 0 auto", display:"flex", gap: isMobile?6:10, overflowX:"auto",
+      padding: isMobile ? "8px 10px" : "10px 20px", background:"rgba(13,16,19,0.97)",
+      borderBottom:"1px solid rgba(255,255,255,0.06)" } },
+      [
+        { label:"Endereços", valor: kpis.capacidade.toLocaleString("pt-BR"), cor:"#8ecff5" },
+        { label:"Ocupados", valor: kpis.ocupadas.toLocaleString("pt-BR"), cor:"#7fd99a" },
+        { label:"Vazios", valor: kpis.vazias.toLocaleString("pt-BR"), cor:"#a8a29a" },
+        { label:"Ocupação", valor: kpis.pctOcupacao + "%", cor:"#e8a13a" },
+        { label:"Vencidos", valor: kpis.vencidas.toLocaleString("pt-BR"), cor:"#ff8a80" },
+        { label:"A vencer ≤15d", valor: kpis.aVencer.toLocaleString("pt-BR"), cor:"#f0c419" },
+        { label:"Danificados", valor: kpis.danificadas.toLocaleString("pt-BR"), cor:"#ff8a80" }
+      ].map(k => h("div", { key:k.label, style:{ flex:"0 0 auto", minWidth: isMobile?84:100,
+          background:"rgba(255,255,255,0.04)", border:"1px solid rgba(255,255,255,0.08)",
+          borderRadius:8, padding: isMobile?"6px 10px":"8px 14px" } },
+        h("div", { style:{ fontSize: isMobile?15:19, fontWeight:700, color:k.cor, fontFamily:"'JetBrains Mono', monospace", lineHeight:1.2 } }, k.valor),
+        h("div", { style:{ fontSize: isMobile?9.5:10.5, color:"#6b6f74", marginTop:1 } }, k.label)
+      ))
+    ),
+
+    page!=="3d" && h(PaginaFn[page], { data, kpis, isMobile, onSelectPos: selectPosByString }),
+
     // --- barra de ruas (atalhos) com indicador de ocupação — também no fluxo normal ---
-    h("div", { style:{ flex:"0 0 auto", display:"flex", gap:4, overflowX:"auto",
+    page==="3d" && h("div", { style:{ flex:"0 0 auto", display:"flex", gap:4, overflowX:"auto",
       padding: isMobile ? "6px 10px" : "6px 20px", background:"rgba(13,16,19,0.97)",
       borderBottom:"1px solid rgba(255,255,255,0.06)" } },
       mainLayout.ruas.map(r => {
@@ -2222,7 +2379,17 @@ function Armazem3D(){
     ),
 
     // --- área principal: viewport 3D + tudo que flutua por cima dela ---
-    h("div", { style:{ position:"relative", flex:"1 1 auto", minHeight:0, overflow:"hidden" } },
+    // Fica sempre montada (nunca desmonta o mountRef!) — o efeito do Three.js que cria o
+    // renderer e anexa o <canvas> a esse div só roda 1x (depende só de data/mainLayout), então
+    // desmontar/remontar esse container deixaria o canvas "órfão" ao voltar pra essa página.
+    // Por isso só escondemos com CSS (display:none) quando a página não é "3d".
+    h("div", { style:{ position:"relative", flex:"1 1 auto", minHeight:0, overflow:"hidden",
+      display: page==="3d" ? "block" : "none" } },
+
+      visao2D && h(Visao2DGrid, { grid2D, onSelectPos: selectPosByString, isMobile }),
+      h(FiltrosAvancadosPanel, { open: filtrosAvOpen, onClose:()=>setFiltrosAvOpen(false), isMobile,
+        ruas: mainLayout.ruas, niveisDisponiveis, filtroRuaDe, setFiltroRuaDe, filtroRuaAte, setFiltroRuaAte,
+        filtroNivel, setFiltroNivel, mode, toggleMode }),
 
       // --- legenda ---
       !(isMobile && viewMode==="walk") && h("div", { style:{ position:"absolute", bottom:16, left: isMobile?12:20, zIndex:10,
@@ -2277,71 +2444,8 @@ function Armazem3D(){
 
       h(DetailPanel, { selected, onClose:()=>setSelected(null) }),
       h(InfoGalpaoPanel, { open: infoOpen, onClose:()=>setInfoOpen(false), isMobile }),
-      h(AnaliseIAPanel, { open: analiseOpen, onClose:()=>setAnaliseOpen(false), isMobile,
-        geminiKey, analise, loading: analiseLoading, erro: analiseErro, onGerar: gerarAnalise }),
-
-      // --- IA do estoque (Gemini) : botão flutuante + painel de chat ---
-      // no celular, em modo "Andar" o D-pad ocupa o canto inferior direito, então o chat sobe pro topo pra não colidir
-      h("button", {
-        onClick:()=>setChatOpen(o=>!o),
-        style:{ position:"absolute", ...(isMobile && viewMode==="walk" ? { top:16 } : { bottom:16 }), right:16, zIndex:12,
-          width:52, height:52, borderRadius:"50%",
-          border:"1px solid rgba(142,207,245,0.5)", background: chatOpen ? "#2e6f77" : "rgba(20,24,28,0.92)",
-          color:"#8ecff5", fontSize:22, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center" }
-      }, "\u{1F916}"),
-
-      chatOpen && h("div", { style:{ position:"absolute",
-        ...(isMobile && viewMode==="walk" ? { top:76 } : { bottom:76 }), right:16, zIndex:12,
-        width: isMobile ? 300 : 320, maxWidth:"90vw",
-        maxHeight:"60vh", background:"rgba(17,20,23,0.98)", border:"1px solid rgba(142,207,245,0.3)", borderRadius:10,
-        display:"flex", flexDirection:"column", overflow:"hidden", boxShadow:"0 8px 24px rgba(0,0,0,0.5)" } },
-
-      h("div", { style:{ padding:"10px 12px", borderBottom:"1px solid rgba(255,255,255,0.08)", display:"flex",
-        alignItems:"center", justifyContent:"space-between" } },
-        h("strong", { style:{ fontSize:13, color:"#8ecff5" } }, "\u{1F916} IA do Estoque"),
-        h("button", { onClick:()=>setChatOpen(false), style:{ background:"none", border:"none", color:"#a8a29a",
-          fontSize:16, cursor:"pointer" } }, "\u2715")),
-
-      !geminiKey ? h("div", { style:{ padding:12, fontSize:12, color:"#a8a29a", display:"flex", flexDirection:"column", gap:8 } },
-        h("div", null, "Cole sua chave gratuita da API do Gemini (pegue em ",
-          h("a", { href:"https://aistudio.google.com/apikey", target:"_blank", rel:"noopener noreferrer",
-            style:{ color:"#8ecff5" } }, "aistudio.google.com/apikey"), "). Fica salva só nesse navegador."),
-        h("input", { type:"password", value:geminiKeyInput, onChange:(e)=>setGeminiKeyInput(e.target.value),
-          placeholder:"AIza...", style:{ padding:"6px 8px", borderRadius:6, border:"1px solid rgba(255,255,255,0.15)",
-          background:"rgba(20,24,28,0.9)", color:"#f4efe6", fontSize:12, outline:"none" } }),
-        h("button", { onClick:saveGeminiKey, style:{ padding:"6px 10px", borderRadius:6, border:"none",
-          background:"#2e6f77", color:"#f4efe6", fontSize:12, fontWeight:600, cursor:"pointer" } }, "Salvar chave"))
-
-      : h(React.Fragment, null,
-        h("div", { style:{ flex:1, overflowY:"auto", padding:"10px 12px", display:"flex", flexDirection:"column", gap:8, fontSize:12 } },
-          chatMessages.length===0 && h("div", { style:{ color:"#6b6f74" } },
-            "Pergunte, por exemplo: \"quantos itens estão vencidos?\", \"o que tem na posição ", 
-            data.length ? data[0].pos : "A.01.1", "?\" ou \"quais clientes têm mais itens danificados?\""),
-          chatMessages.map((m,i)=> h("div", { key:i, style:{
-              alignSelf: m.role==="user" ? "flex-end" : "flex-start",
-              maxWidth:"90%", padding:"6px 10px", borderRadius:8, whiteSpace:"pre-wrap",
-              background: m.role==="user" ? "#2e6f77" : m.role==="erro" ? "rgba(192,57,43,0.25)" : "rgba(255,255,255,0.06)",
-              color: m.role==="erro" ? "#ff8a80" : "#f4efe6" } },
-            m.text)),
-          chatLoading && h("div", { style:{ color:"#6b6f74", alignSelf:"flex-start" } }, "Pensando...")),
-
-        h("div", { style:{ padding:8, borderTop:"1px solid rgba(255,255,255,0.08)", display:"flex", gap:6 } },
-          h("input", { type:"text", value:chatInput, onChange:(e)=>setChatInput(e.target.value),
-            onKeyDown:(e)=>{ if(e.key==="Enter") sendChatMessage(); },
-            placeholder:"Pergunte sobre o estoque...", style:{ flex:1, padding:"6px 8px", borderRadius:6,
-            border:"1px solid rgba(255,255,255,0.15)", background:"rgba(20,24,28,0.9)", color:"#f4efe6",
-            fontSize:12, outline:"none" } }),
-          h("button", { onClick:sendChatMessage, disabled:chatLoading, style:{ padding:"6px 12px", borderRadius:6,
-            border:"none", background:"#2e6f77", color:"#f4efe6", fontSize:12, fontWeight:600,
-            cursor: chatLoading ? "default" : "pointer", opacity: chatLoading ? 0.6 : 1 } }, "Enviar"),
-          h("button", { onClick:forgetGeminiKey, title:"Esquecer chave salva", style:{ padding:"6px 8px",
-            borderRadius:6, border:"1px solid rgba(255,255,255,0.15)", background:"transparent",
-            color:"#6b6f74", fontSize:11, cursor:"pointer" } }, "\u{1F511}"),
-          h("button", { onClick:limparConversa, title:"Limpar conversa salva", style:{ padding:"6px 8px",
-            borderRadius:6, border:"1px solid rgba(255,255,255,0.15)", background:"transparent",
-            color:"#6b6f74", fontSize:11, cursor:"pointer" } }, "\u{1F5D1}\uFE0F")))
-      )
     )
+    ) // fecha a coluna de conteúdo (título + KPIs + páginas) ao lado do AppNav
   );
 }
 
