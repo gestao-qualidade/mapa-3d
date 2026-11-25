@@ -190,6 +190,29 @@ function annotatePositions(positions){
   return positions;
 }
 
+// Mesma regra de combinação de filtro que a cena 3D usa (entryMatchesMode lá
+// dentro do efeito Three.js) — reaproveitada aqui, em JS puro, pra Visão 2D
+// (e qualquer outra lista fora do canvas) destacar/esconder exatamente igual.
+function posicaoCombinaModo(p, mode, risco){
+  if(!mode || mode.type==="none" || mode.type==="busca") return true;
+  if(mode.type==="vazio") return p.itens.length===0;
+  if(p.itens.length===0) return false; // vencido/danificado/risco/cliente/família exigem item
+  if(mode.type==="vencido")    return risco==="vencido";
+  if(mode.type==="danificado") return p.itens.some(it=>isTruthy(it[8]));
+  if(mode.type==="risco")      return !!risco;
+  if(mode.type==="cliente")    return p.itens.some(it=>String(it[0]||"").trim()===String(mode.value||"").trim());
+  if(mode.type==="familia")    return p.itens.some(it=>String(it[10]||"").trim()===String(mode.value||"").trim());
+  return true;
+}
+// Cor sólida de destaque pro filtro ativo, igual entryHighlightColor() na cena 3D.
+function corDestaqueModo(mode){
+  if(!mode) return null;
+  if(mode.type==="vencido" || mode.type==="danificado" || mode.type==="risco") return "#e63946";
+  if(mode.type==="cliente") return "#ffd400";
+  if(mode.type==="familia") return corFamilia(mode.value);
+  return null;
+}
+
 /* =========================================================================
    IMPORTAÇÃO DE PLANILHA DO ERP (.xls / .xlsx / .csv)
    O usuário seleciona o arquivo que sempre sobe pra atualizar o saldo; aqui a
@@ -420,7 +443,8 @@ function DetailPanel({ selected, onClose }){
   const itens = selected.itens.map(itemToObj);
   return h("div", {
     style: { position:"absolute", top:0, right:0, width:360, maxWidth:"90vw", height:"100%",
-      background:"rgba(17,20,23,0.97)", color:"#f4efe6", padding:"20px 18px", overflowY:"auto",
+      background:"linear-gradient(195deg, rgba(21,26,29,0.97) 0%, rgba(13,16,19,0.97) 55%, rgba(22,17,11,0.97) 100%)",
+      color:"#f4efe6", padding:"20px 18px", overflowY:"auto",
       boxShadow:"-8px 0 24px rgba(0,0,0,0.4)", fontFamily:"'Inter', system-ui, sans-serif",
       borderLeft:"1px solid rgba(232,161,58,0.25)", zIndex:20 } },
     h("div", { style:{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:4 } },
@@ -510,7 +534,8 @@ function InfoGalpaoPanel({ open, onClose, isMobile }){
   if(!open) return null;
   return h("div", {
     style:{ position:"absolute", top:0, left:0, width:340, maxWidth:"90vw", height:"100%",
-      background:"rgba(17,20,23,0.97)", color:"#f4efe6", padding:"20px 18px", overflowY:"auto",
+      background:"linear-gradient(165deg, rgba(21,26,29,0.97) 0%, rgba(13,16,19,0.97) 55%, rgba(11,20,22,0.97) 100%)",
+      color:"#f4efe6", padding:"20px 18px", overflowY:"auto",
       boxShadow:"8px 0 24px rgba(0,0,0,0.4)", fontFamily:"'Inter', system-ui, sans-serif",
       borderRight:"1px solid rgba(142,207,245,0.25)", zIndex:20, fontSize:12.5, lineHeight:1.5 }
   },
@@ -611,31 +636,43 @@ function AppNav({ page, setPage, isMobile }){
     { id:"enderecos", label:"Endereços", icone:"\u{1F4CD}" },
     { id:"relatorios", label:"Relatórios", icone:"\u{1F4CA}" }
   ];
+  // Emblema da marca: usa /logo-pierserv.png se esse arquivo existir ao lado do
+  // index.html (ainda não enviado); enquanto isso, cai sempre num monograma
+  // "PS" em gradiente desenhado em CSS — nunca aparece um ícone quebrado.
+  const brandMark = h("div", { style:{ position:"relative", width:34, height:34, flex:"0 0 auto" } },
+    h("div", { style:{ position:"absolute", inset:0, borderRadius:9, background:"linear-gradient(135deg, #3ab0c2 0%, #2a6f77 55%, #19424a 100%)",
+      display:"flex", alignItems:"center", justifyContent:"center", boxShadow:"0 2px 8px rgba(0,0,0,0.35)" } },
+      h("span", { style:{ color:"#f4efe6", fontWeight:800, fontSize:14, fontFamily:"'JetBrains Mono', monospace", letterSpacing:"-0.03em" } }, "PS")),
+    h("img", { src:"./logo-pierserv.png", alt:"PierServ",
+      style:{ position:"absolute", inset:0, width:"100%", height:"100%", objectFit:"contain", borderRadius:9 },
+      onError:(e)=>{ e.target.style.display="none"; } })
+  );
   if(isMobile){
     return h("div", { style:{ flex:"0 0 auto", display:"flex", overflowX:"auto",
-      background:"rgba(9,11,13,0.98)", borderBottom:"1px solid rgba(255,255,255,0.06)" } },
+      background:"linear-gradient(180deg, #14181b 0%, #0a0c0e 100%)", borderBottom:"1px solid rgba(255,255,255,0.06)" } },
       itens.map(it => h("button", { key:it.id, onClick:()=>setPage(it.id),
         style:{ flex:"0 0 auto", display:"flex", alignItems:"center", gap:5, padding:"8px 12px",
-          background: page===it.id ? "rgba(142,207,245,0.14)" : "transparent",
+          background: page===it.id ? "linear-gradient(180deg, rgba(142,207,245,0.22), rgba(142,207,245,0.08))" : "transparent",
           color: page===it.id ? "#8ecff5" : "#a8a29a", border:"none",
           borderBottom: page===it.id ? "2px solid #8ecff5" : "2px solid transparent",
           fontSize:12, fontWeight:600, cursor:"pointer", whiteSpace:"nowrap" } },
         it.icone, " ", it.label))
     );
   }
-  return h("div", { style:{ flex:"0 0 auto", width:168, display:"flex", flexDirection:"column",
-    background:"rgba(9,11,13,0.98)", borderRight:"1px solid rgba(255,255,255,0.06)", padding:"14px 10px" } },
-    h("div", { style:{ display:"flex", alignItems:"center", gap:8, padding:"0 6px 16px" } },
-      h("span", { style:{ fontSize:20 } }, "\u{1F4E6}"),
+  return h("div", { style:{ flex:"0 0 auto", width:172, display:"flex", flexDirection:"column",
+    background:"linear-gradient(165deg, #14181b 0%, #0d1013 45%, #0a0c0e 100%)",
+    borderRight:"1px solid rgba(255,255,255,0.06)", padding:"14px 10px" } },
+    h("div", { style:{ display:"flex", alignItems:"center", gap:9, padding:"2px 4px 18px" } },
+      brandMark,
       h("div", null,
-        h("div", { style:{ fontSize:13, fontWeight:700, color:"#f4efe6", fontFamily:"'JetBrains Mono', monospace" } }, "MAPA 3D"),
-        h("div", { style:{ fontSize:9.5, color:"#6b6f74" } }, "IMAGINAE"))
+        h("div", { style:{ fontSize:13, fontWeight:700, color:"#f4efe6", fontFamily:"'JetBrains Mono', monospace", letterSpacing:"-0.01em" } }, "MAPA 3D"),
+        h("div", { style:{ fontSize:9.5, color:"#8ecff5", fontWeight:600 } }, "PIERSERV"))
     ),
     itens.map(it => h("button", { key:it.id, onClick:()=>setPage(it.id),
       style:{ display:"flex", alignItems:"center", gap:9, padding:"9px 10px", marginBottom:2, borderRadius:7,
-        background: page===it.id ? "rgba(142,207,245,0.14)" : "transparent",
-        color: page===it.id ? "#8ecff5" : "#a8a29a", border:"none", textAlign:"left",
-        fontSize:12.5, fontWeight:600, cursor:"pointer" } },
+        background: page===it.id ? "linear-gradient(90deg, rgba(142,207,245,0.18), rgba(142,207,245,0.05))" : "transparent",
+        color: page===it.id ? "#8ecff5" : "#a8a29a", border:"none", borderLeft: page===it.id ? "2px solid #8ecff5" : "2px solid transparent",
+        textAlign:"left", fontSize:12.5, fontWeight:600, cursor:"pointer" } },
       h("span", null, it.icone), h("span", null, it.label)))
   );
 }
@@ -645,32 +682,81 @@ function AppNav({ page, setPage, isMobile }){
    alternativa de leitura rápida à cena 3D (sobreposta ao canvas, mesma
    página "Visualização 3D").
    ========================================================================= */
-function Visao2DGrid({ grid2D, onSelectPos, isMobile }){
+function Visao2DGrid({ grid2D, onSelectPos, onJumpRua, isMobile, mode, modeLabel, filtroNivel }){
   if(!grid2D) return null;
-  return h("div", { style:{ position:"absolute", inset:0, zIndex:11, background:"#15181b",
-    overflow:"auto", padding: isMobile ? "10px" : "16px 20px" } },
+  const corDestaque = corDestaqueModo(mode);
+  const filtrando = !!mode && mode.type!=="none" && mode.type!=="busca";
+  const maxColGeral = grid2D.reduce((m,r)=>Math.max(m, r.colunas.length), 0);
+  const tamanhoCel = isMobile ? 12 : 15;
+  return h("div", { style:{ position:"absolute", inset:0, zIndex:11,
+      background:"linear-gradient(165deg, #171c1f 0%, #121618 55%, #10191b 100%)",
+      overflow:"auto", padding: isMobile ? "10px" : "16px 20px" } },
+
+    // --- cabeçalho: contexto do que está sendo mostrado (faixa de rua, nível, filtro ativo) ---
+    h("div", { style:{ display:"flex", flexWrap:"wrap", alignItems:"center", gap:10, marginBottom:14,
+        paddingBottom:10, borderBottom:"1px solid rgba(255,255,255,0.08)" } },
+      h("div", { style:{ fontSize:13, fontWeight:700, color:"#f4efe6" } }, "\u{1F5FA}️ Visão 2D — planta por rua/coluna"),
+      h("div", { style:{ fontSize:11, color:"#6b6f74" } },
+        grid2D.length, " rua(s)", filtroNivel!=null ? " \xB7 nível " + filtroNivel : " \xB7 todos os níveis"),
+      modeLabel && h("div", { style:{ marginLeft: isMobile?0:"auto", display:"flex", alignItems:"center", gap:6,
+          background: corDestaque ? corDestaque+"26" : "rgba(142,207,245,0.14)",
+          border:"1px solid " + (corDestaque || "#8ecff5"), borderRadius:6, padding:"4px 10px" } },
+        h("span", { style:{ width:9, height:9, borderRadius:"50%", background: corDestaque || "#8ecff5", flex:"0 0 auto" } }),
+        h("span", { style:{ fontSize:11, color:"#f4efe6", fontWeight:600 } }, modeLabel))
+    ),
+
+    filtrando && h("div", { style:{ fontSize:10.5, color:"#6b6f74", marginBottom:8 } },
+      "As células esmaecidas abaixo não combinam com o filtro ativo \xB7 as destacadas combinam."),
+
     grid2D.length===0 && h("div", { style:{ color:"#a8a29a", fontSize:13 } }, "Nenhuma rua na faixa selecionada."),
+
+    // --- réguas de coluna (a cada 5) pra dar referência de onde cada posição fica ---
+    maxColGeral>0 && h("div", { style:{ display:"flex", alignItems:"center", gap:6, marginBottom:4 } },
+      h("div", { style:{ width: isMobile?44:56, flex:"0 0 auto" } }),
+      h("div", { style:{ display:"flex", gap:2 } },
+        Array.from({ length: maxColGeral }).map((_,i)=> h("div", { key:i,
+          style:{ width: tamanhoCel, flex:"0 0 auto", fontSize:8.5, color:"#55595e", textAlign:"center" } },
+          (i+1)%5===0 ? String(i+1) : "")))
+    ),
+
     h("div", { style:{ display:"inline-block", minWidth:"100%" } },
       grid2D.map(({ rua, colunas })=> h("div", { key:rua, style:{ display:"flex", alignItems:"center", gap:6, marginBottom:3 } },
-        h("div", { style:{ width:52, flex:"0 0 auto", fontSize:11, fontWeight:700, color:"#8ecff5",
-          fontFamily:"'JetBrains Mono', monospace" } }, "RUA " + rua),
+        h("button", { onClick:()=>onJumpRua && onJumpRua(rua),
+          title:"Ir pra rua " + rua + " na Visão 3D",
+          style:{ width: isMobile?44:56, flex:"0 0 auto", fontSize:11, fontWeight:700, color:"#8ecff5",
+          fontFamily:"'JetBrains Mono', monospace", background:"none", border:"none", textAlign:"left",
+          cursor:"pointer", padding:0 } }, "RUA " + rua),
         h("div", { style:{ display:"flex", gap:2 } },
-          colunas.map((c,i)=> h("div", {
-            key:i,
-            title: c.pos ? (c.pos + " — " + STATUS2D_LABELS[c.status] + " — " + c.itens + " lote(s)") : ("Coluna " + (i+1) + " — vazia"),
-            onClick: ()=> c.pos && onSelectPos(c.pos),
-            style:{ width: isMobile?13:16, height: isMobile?13:16, borderRadius:3,
-              background: STATUS2D_CORES[c.status], cursor: c.pos ? "pointer" : "default",
-              flex:"0 0 auto", opacity: c.pos ? 1 : 0.45 }
-          }))
+          colunas.map((c,i)=> {
+            const combina = !filtrando || c.match;
+            return h("div", {
+              key:i,
+              title: c.pos ? (c.pos + " — " + STATUS2D_LABELS[c.status] + " — " + c.itens + " lote(s)" + (filtrando ? (combina ? " — combina com o filtro" : " — fora do filtro") : "")) : ("Coluna " + (i+1) + " — vazia"),
+              onClick: ()=> c.pos && onSelectPos(c.pos),
+              style:{ width: tamanhoCel, height: tamanhoCel, borderRadius:3,
+                background: (combina && corDestaque && c.pos) ? corDestaque : STATUS2D_CORES[c.status],
+                cursor: c.pos ? "pointer" : "default", flex:"0 0 auto",
+                opacity: !c.pos ? 0.35 : (combina ? 1 : 0.14),
+                boxShadow: (filtrando && combina && c.pos) ? "0 0 0 1.5px " + (corDestaque || "#f4efe6") + ", 0 0 6px " + (corDestaque || "#f4efe6") + "99" : "none",
+                transition:"opacity 0.15s" }
+            });
+          })
         )
       ))
     ),
+
     h("div", { style:{ display:"flex", gap:14, flexWrap:"wrap", marginTop:16, paddingTop:12,
       borderTop:"1px solid rgba(255,255,255,0.08)" } },
       Object.keys(STATUS2D_CORES).map(k => h("div", { key:k, style:{ display:"flex", alignItems:"center", gap:5 } },
         h("span", { style:{ width:12, height:12, borderRadius:3, background:STATUS2D_CORES[k] } }),
-        h("span", { style:{ fontSize:11, color:"#a8a29a" } }, STATUS2D_LABELS[k]))))
+        h("span", { style:{ fontSize:11, color:"#a8a29a" } }, STATUS2D_LABELS[k]))),
+      filtrando && h("div", { style:{ display:"flex", alignItems:"center", gap:5 } },
+        h("span", { style:{ width:12, height:12, borderRadius:3, background: corDestaque || "#8ecff5",
+          boxShadow:"0 0 0 1.5px " + (corDestaque || "#8ecff5") } }),
+        h("span", { style:{ fontSize:11, color:"#a8a29a" } }, "Combina com o filtro")),
+      filtrando && h("div", { style:{ display:"flex", alignItems:"center", gap:5 } },
+        h("span", { style:{ width:12, height:12, borderRadius:3, background:"#3a3f44", opacity:0.4 } }),
+        h("span", { style:{ fontSize:11, color:"#a8a29a" } }, "Fora do filtro")))
   );
 }
 
@@ -688,7 +774,8 @@ function FiltrosAvancadosPanel({ open, onClose, isMobile, ruas, niveisDisponivei
       color:"#f4efe6", fontSize:11.5, fontWeight:600, cursor:"pointer" } }, "Nível " + n);
   return h("div", {
     style:{ position:"absolute", top:0, left:0, width:240, maxWidth:"88vw", height:"100%",
-      background:"rgba(17,20,23,0.98)", color:"#f4efe6", padding:"18px 16px", overflowY:"auto",
+      background:"linear-gradient(165deg, rgba(21,26,29,0.98) 0%, rgba(13,16,19,0.98) 55%, rgba(11,20,22,0.98) 100%)",
+      color:"#f4efe6", padding:"18px 16px", overflowY:"auto",
       boxShadow:"8px 0 24px rgba(0,0,0,0.4)", fontFamily:"'Inter', system-ui, sans-serif",
       borderRight:"1px solid rgba(142,207,245,0.25)", zIndex:21, fontSize:12.5 }
   },
@@ -803,7 +890,7 @@ function PaginaProdutos({ data, isMobile }){
       )
     ),
     h("div", { style:{ display:"grid", gridTemplateColumns: isMobile ? "1fr" : "repeat(auto-fill, minmax(260px, 1fr))", gap:12 } },
-      produtos.map(pr => h("div", { key:pr.codigo, style:{ background:"rgba(255,255,255,0.04)",
+      produtos.map(pr => h("div", { key:pr.codigo, style:{ background:"linear-gradient(165deg, rgba(255,255,255,0.055) 0%, rgba(255,255,255,0.025) 100%)",
           border:"1px solid rgba(255,255,255,0.08)", borderRadius:10, padding:"14px 16px" } },
         h("div", { style:{ fontWeight:700, color:"#f4efe6", fontSize:13, marginBottom:2, lineHeight:1.3 } }, pr.desc || pr.codigo),
         h("div", { style:{ fontSize:11, color:"#6b6f74", fontFamily:"'JetBrains Mono', monospace", marginBottom:10 } },
@@ -915,7 +1002,7 @@ function PaginaRelatorios({ data, kpis, isMobile }){
 
     h("div", { style:{ display:"grid", gridTemplateColumns: isMobile ? "1fr" : "1fr 1fr", gap:16 } },
 
-      kpis && h("div", { style:{ background:"rgba(255,255,255,0.04)", border:"1px solid rgba(255,255,255,0.08)", borderRadius:10, padding:"16px 18px" } },
+      kpis && h("div", { style:{ background:"linear-gradient(165deg, rgba(255,255,255,0.055) 0%, rgba(255,255,255,0.025) 100%)", border:"1px solid rgba(255,255,255,0.08)", borderRadius:10, padding:"16px 18px" } },
         h("div", { style:{ fontWeight:700, marginBottom:12, color:"#f4efe6", fontSize:13 } }, "Distribuição por status"),
         BarraHorizontal({ label:"Ocupados", valor:kpis.ocupadas, max:kpis.capacidade, cor:STATUS2D_CORES.ocupado }),
         BarraHorizontal({ label:"Vazios", valor:kpis.vazias, max:kpis.capacidade, cor:STATUS2D_CORES.vazio }),
@@ -924,13 +1011,13 @@ function PaginaRelatorios({ data, kpis, isMobile }){
         BarraHorizontal({ label:"Danificados", valor:kpis.danificadas, max:kpis.capacidade, cor:STATUS2D_CORES.danificado })
       ),
 
-      h("div", { style:{ background:"rgba(255,255,255,0.04)", border:"1px solid rgba(255,255,255,0.08)", borderRadius:10, padding:"16px 18px" } },
+      h("div", { style:{ background:"linear-gradient(165deg, rgba(255,255,255,0.055) 0%, rgba(255,255,255,0.025) 100%)", border:"1px solid rgba(255,255,255,0.08)", borderRadius:10, padding:"16px 18px" } },
         h("div", { style:{ fontWeight:700, marginBottom:12, color:"#f4efe6", fontSize:13 } }, "Itens por família"),
         porFamilia.slice(0,10).map(f => h(React.Fragment, { key:f.label },
           BarraHorizontal({ label:f.label, valor:f.valor, max:maxFamilia, cor:"#8ecff5" })))
       ),
 
-      h("div", { style:{ background:"rgba(255,255,255,0.04)", border:"1px solid rgba(255,255,255,0.08)", borderRadius:10, padding:"16px 18px", gridColumn: isMobile ? "auto" : "1 / span 2" } },
+      h("div", { style:{ background:"linear-gradient(165deg, rgba(255,255,255,0.055) 0%, rgba(255,255,255,0.025) 100%)", border:"1px solid rgba(255,255,255,0.08)", borderRadius:10, padding:"16px 18px", gridColumn: isMobile ? "auto" : "1 / span 2" } },
         h("div", { style:{ fontWeight:700, marginBottom:12, color:"#f4efe6", fontSize:13 } }, "Produtos mais armazenados (por quantidade)"),
         topProdutos.map(p => h(React.Fragment, { key:p.label },
           BarraHorizontal({ label:p.label, valor:p.valor, max:maxProduto, cor:"#e8a13a" })))
@@ -1116,6 +1203,9 @@ function Armazem3D(){
     if(!mainLayout || !visao2D) return null;
     const hoje = new Date(); hoje.setHours(0,0,0,0);
     const ordemStatus = { vencido:5, danificado:4, aVencer:3, ocupado:2, vazio:1 };
+    // filtro "ativo de verdade" = os mesmos modos que escondem posição na cena
+    // 3D (busca não esconde nada lá, só realça — tratamos igual aqui)
+    const filtrando = !!mode && mode.type!=="none" && mode.type!=="busca";
     return ruasFiltradas.map(rua=>{
       const maxCol = mainLayout.maxColByRua[rua] || 0;
       const porColuna = new Map();
@@ -1128,18 +1218,22 @@ function Armazem3D(){
         if(risco==="vencido") status = "vencido";
         else if(danificado) status = "danificado";
         else if(risco==="critico" || risco==="atencao") status = "aVencer";
+        const match = posicaoCombinaModo(p, mode, risco);
         const atual = porColuna.get(p.col);
-        if(!atual || ordemStatus[status] > ordemStatus[atual.status]){
-          porColuna.set(p.col, { status, pos:p.pos, itens:p.itens.length });
-        }
+        // numa coluna com vários níveis, prioriza mostrar o nível que combina
+        // com o filtro ativo — senão um "match" pode ficar escondido atrás de
+        // outro nível na mesma coluna que não combina
+        const melhorQueAtual = !atual || (match && !atual.match) ||
+          (match === atual.match && ordemStatus[status] > ordemStatus[atual.status]);
+        if(melhorQueAtual) porColuna.set(p.col, { status, pos:p.pos, itens:p.itens.length, match });
       });
       const colunas = [];
       for(let c=1; c<=maxCol; c++){
-        colunas.push(porColuna.get(c) || { status:"vazio", pos:null, itens:0 });
+        colunas.push(porColuna.get(c) || { status:"vazio", pos:null, itens:0, match: !filtrando || mode.type==="vazio" });
       }
       return { rua, colunas };
     });
-  }, [mainLayout, ruasFiltradas, filtroNivel, visao2D]);
+  }, [mainLayout, ruasFiltradas, filtroNivel, visao2D, mode]);
 
   const clientes = useMemo(()=>{
     if(!data) return [];
@@ -2241,10 +2335,11 @@ function Armazem3D(){
     // --- barra superior (fica no fluxo normal da página: nunca sobrepõe o resto) ---
     h("div", { style:{ flex:"0 0 auto", display:"flex", justifyContent:"space-between", alignItems:"flex-start",
       padding: isMobile ? "10px 12px" : "16px 20px", flexWrap:"wrap", gap:8,
-      background:"rgba(13,16,19,0.97)", borderBottom:"1px solid rgba(255,255,255,0.06)" } },
+      background:"linear-gradient(120deg, #151a1d 0%, #0f1316 55%, #0d1a1c 100%)",
+      borderBottom:"1px solid rgba(142,207,245,0.12)" } },
 
       h("div", { style:{ flex:"1 1 240px", minWidth:0 } },
-        h("h1", { style:{ margin:0, fontSize: isMobile?16:20, color:"#f4efe6", letterSpacing:"-0.02em", fontFamily:"'JetBrains Mono', monospace" } }, "ARMAZÉM 3D — IMAGINAE"),
+        h("h1", { style:{ margin:0, fontSize: isMobile?16:20, color:"#f4efe6", letterSpacing:"-0.02em", fontFamily:"'JetBrains Mono', monospace" } }, "ARMAZÉM 3D — PS LOGÍSTICA"),
         h("p", { style:{ margin:"2px 0 8px", fontSize: isMobile?11:12, color:"#a8a29a" } },
           data.length.toLocaleString("pt-BR"), " posições \xB7 ", totalItens.toLocaleString("pt-BR"), " lotes/SKUs \xB7 ",
           mainLayout.ruas.length, " ruas",
@@ -2334,21 +2429,21 @@ function Armazem3D(){
 
     // --- barra de KPIs (indicadores gerais do galpão, sempre sobre os dados atuais) ---
     kpis && h("div", { style:{ flex:"0 0 auto", display:"flex", gap: isMobile?6:10, overflowX:"auto",
-      padding: isMobile ? "8px 10px" : "10px 20px", background:"rgba(13,16,19,0.97)",
-      borderBottom:"1px solid rgba(255,255,255,0.06)" } },
+      padding: isMobile ? "8px 10px" : "10px 20px", background:"linear-gradient(120deg, #11171a 0%, #0d1013 60%, #0c1517 100%)",
+      borderBottom:"1px solid rgba(142,207,245,0.1)" } },
       [
-        { label:"Endereços", valor: kpis.capacidade.toLocaleString("pt-BR"), cor:"#8ecff5" },
-        { label:"Ocupados", valor: kpis.ocupadas.toLocaleString("pt-BR"), cor:"#7fd99a" },
-        { label:"Vazios", valor: kpis.vazias.toLocaleString("pt-BR"), cor:"#a8a29a" },
-        { label:"Ocupação", valor: kpis.pctOcupacao + "%", cor:"#e8a13a" },
-        { label:"Vencidos", valor: kpis.vencidas.toLocaleString("pt-BR"), cor:"#ff8a80" },
-        { label:"A vencer ≤15d", valor: kpis.aVencer.toLocaleString("pt-BR"), cor:"#f0c419" },
-        { label:"Danificados", valor: kpis.danificadas.toLocaleString("pt-BR"), cor:"#ff8a80" }
+        { label:"Endereços", valor: kpis.capacidade.toLocaleString("pt-BR"), cor:"#8ecff5", grad:"rgba(142,207,245,0.16), rgba(142,207,245,0.03)" },
+        { label:"Ocupados", valor: kpis.ocupadas.toLocaleString("pt-BR"), cor:"#7fd99a", grad:"rgba(127,217,154,0.16), rgba(127,217,154,0.03)" },
+        { label:"Vazios", valor: kpis.vazias.toLocaleString("pt-BR"), cor:"#a8a29a", grad:"rgba(168,162,154,0.14), rgba(168,162,154,0.02)" },
+        { label:"Ocupação", valor: kpis.pctOcupacao + "%", cor:"#e8a13a", grad:"rgba(232,161,58,0.18), rgba(232,161,58,0.03)" },
+        { label:"Vencidos", valor: kpis.vencidas.toLocaleString("pt-BR"), cor:"#ff8a80", grad:"rgba(255,138,128,0.18), rgba(255,138,128,0.03)" },
+        { label:"A vencer ≤15d", valor: kpis.aVencer.toLocaleString("pt-BR"), cor:"#f0c419", grad:"rgba(240,196,25,0.16), rgba(240,196,25,0.03)" },
+        { label:"Danificados", valor: kpis.danificadas.toLocaleString("pt-BR"), cor:"#ff8a80", grad:"rgba(255,138,128,0.18), rgba(255,138,128,0.03)" }
       ].map(k => h("div", { key:k.label, style:{ flex:"0 0 auto", minWidth: isMobile?84:100,
-          background:"rgba(255,255,255,0.04)", border:"1px solid rgba(255,255,255,0.08)",
-          borderRadius:8, padding: isMobile?"6px 10px":"8px 14px" } },
+          background:"linear-gradient(165deg, " + k.grad + ")", border:"1px solid rgba(255,255,255,0.09)",
+          borderRadius:8, padding: isMobile?"6px 10px":"8px 14px", boxShadow:"inset 0 1px 0 rgba(255,255,255,0.05)" } },
         h("div", { style:{ fontSize: isMobile?15:19, fontWeight:700, color:k.cor, fontFamily:"'JetBrains Mono', monospace", lineHeight:1.2 } }, k.valor),
-        h("div", { style:{ fontSize: isMobile?9.5:10.5, color:"#6b6f74", marginTop:1 } }, k.label)
+        h("div", { style:{ fontSize: isMobile?9.5:10.5, color:"#9aa0a6", marginTop:1 } }, k.label)
       ))
     ),
 
@@ -2386,7 +2481,8 @@ function Armazem3D(){
     h("div", { style:{ position:"relative", flex:"1 1 auto", minHeight:0, overflow:"hidden",
       display: page==="3d" ? "block" : "none" } },
 
-      visao2D && h(Visao2DGrid, { grid2D, onSelectPos: selectPosByString, isMobile }),
+      visao2D && h(Visao2DGrid, { grid2D, onSelectPos: selectPosByString, isMobile, mode, modeLabel, filtroNivel,
+        onJumpRua: (rua)=>{ setVisao2D(false); jumpToRua(rua); } }),
       h(FiltrosAvancadosPanel, { open: filtrosAvOpen, onClose:()=>setFiltrosAvOpen(false), isMobile,
         ruas: mainLayout.ruas, niveisDisponiveis, filtroRuaDe, setFiltroRuaDe, filtroRuaAte, setFiltroRuaAte,
         filtroNivel, setFiltroNivel, mode, toggleMode }),
