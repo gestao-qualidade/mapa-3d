@@ -1,0 +1,2352 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Armazém 3D — Imaginae</title>
+<style>
+  html, body, #root { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #0d1013; }
+  * { box-sizing: border-box; }
+  ::-webkit-scrollbar { width: 8px; }
+  ::-webkit-scrollbar-thumb { background: #3a3f45; border-radius: 4px; }
+  button { font-family: 'Inter', system-ui, sans-serif; }
+</style>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/three@0.160.0/build/three.min.js"></script>
+<script src="https://unpkg.com/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+</head>
+<body>
+<div id="root">
+  <div style="display:flex;align-items:center;justify-content:center;height:100vh;color:#a8a29a;font-family:system-ui;font-size:14px;">
+    Carregando armazém...
+  </div>
+</div>
+
+<script>
+const { useEffect, useRef, useState, useMemo, useCallback } = React;
+const h = React.createElement;
+
+/* =========================================================================
+   CONSTANTES DE LAYOUT
+   ========================================================================= */
+const COL_SPACING   = 1.35;   // largura de cada posição (coluna) no eixo Z
+const LEVEL_HEIGHT  = 1.9;    // altura de cada nível
+const RACK_DEPTH    = 1.15;   // profundidade da estrutura da estante
+const AISLE_WIDTH   = 3.4;    // largura do corredor entre duas ruas
+const CORRIDOR_GAP  = 2.6;    // espaço entre corredores
+const BASE_LEVEL_Y  = 0.15;
+const BEAM_THICK    = 0.08;
+const POST_SIZE     = 0.12;
+const BLOCK_GAP     = 18;     // espaço entre o galpão principal e o bloco fictício
+const COLUMN_TAG_STEP = 5;    // a cada quantas colunas colocar uma plaquinha numerada
+
+const ITEM_FIELDS = ["cliente","codigo","desc","qtde","lote","validade","vencido","perecivel","danificado","giroScore","familia"];
+function itemToObj(arr){ const o = {}; ITEM_FIELDS.forEach((k,i)=>o[k]=arr[i]); return o; }
+
+/* =========================================================================
+   COR POR GIRO (velocidade de movimentação do estoque)
+   ========================================================================= */
+function giroColor(g){
+  const fast = new THREE.Color(0x2e8b57);
+  const mid  = new THREE.Color(0xe8a13a);
+  const slow = new THREE.Color(0xc0392b);
+  const out  = new THREE.Color();
+  return g < 0.5 ? out.copy(fast).lerp(mid, g*2) : out.copy(mid).lerp(slow, (g-0.5)*2);
+}
+const COLOR_VENCIDO_DANIFICADO = new THREE.Color(0xe63946); // vermelho sólido: vencido, danificado E a vencer (unificado a pedido)
+const COLOR_VENCE_7D           = new THREE.Color(0xff8c1a); // laranja: usado só no contorno pulsante passivo (sem filtro ativo)
+const COLOR_VENCE_15D          = new THREE.Color(0xf0c419); // amarelo: usado só no contorno pulsante passivo (sem filtro ativo)
+const COLOR_CLIENTE_DESTAQUE   = new THREE.Color(0xffd400); // amarelo sólido de destaque do filtro Cliente
+const COLOR_VAZIO              = new THREE.Color(0xffffff); // branco sólido para posições vazias
+const COLOR_HOVER              = new THREE.Color(0xffffff);
+const COLOR_SELECT             = new THREE.Color(0x2e6f77);
+const COLOR_PALLET             = new THREE.Color(0xe3c99a); // madeira clara do palete — bem mais claro que o papelão
+const COLOR_PAPELAO             = [ new THREE.Color(0xb5834a), new THREE.Color(0xa8763f), new THREE.Color(0xc2925c), new THREE.Color(0x9c6f3a) ]; // papelão mais escuro/saturado que o palete
+
+// paleta do filtro Família — categorias REAIS da planilha (BRINDE, VESTUARIO,
+// DISPLAY, PRODUTO, GRÁFICO). Cores sólidas distintas, no mesmo espírito visual
+// da legenda por blocos de cor do PDF, mas aplicadas às categorias verdadeiras
+// do WMS (a planta não amarra zona sanitária a posição, então não dá pra usar
+// as cores dela sem inventar dados).
+const FAMILIA_CORES = {
+  "BRINDE":    "#2e8b57",
+  "VESTUARIO": "#c9781f",
+  "DISPLAY":   "#2255aa",
+  "PRODUTO":   "#c2298a",
+  "GRÁFICO":   "#3aa7a0",
+  "":          "#888888"
+};
+function corFamilia(fam){
+  return FAMILIA_CORES[fam] || "#888888";
+}
+
+// Zonas de produto da planta oficial (Processo PMB 059627/2026), LIDAS
+// DIRETAMENTE da planta em alta resolução (Planta Pavimento Térreo, Galpão 07):
+// ruas 01-03 = Alimentos (com um bolsão de Não Conformes e uma pequena faixa
+// de Cosméticos no trecho final, perto dos eixos K-M); ruas 04-07 = Cosméticos
+// (sobreposta pela "Área Segregada de Produtos Relacionados à Saúde"); rua 08 =
+// dividida, metade Quarentena / metade Saneantes; ruas 09 em diante = Produtos
+// Sem Interesse à Saúde (a grande maioria do galpão), com um bolsão de "Área
+// Segregada (Alto Valor)" perto da divisa com o Galpão 10 (ruas ~28-29).
+// A planilha de estoque não tem campo que amarre posição → zona sanitária,
+// então a pintura de piso segue a ORDEM real das ruas (01, 02, 03...) lida na
+// planta — não é mais uma proporção estimada, mas também não é confirmada
+// posição-a-posição com o WMS.
+const ZONA_CORES = {
+  alimentos:     0x2e8b57,
+  cosmeticos:    0xe08a2e,
+  quarentena:    0xd633a6,
+  saneantes:     0x3b6fd8,
+  naoConformes:  0xd83030,
+  altoValor:     0x9b59b6,
+  semInteresse:  0x4fd1c5
+};
+function zonaPorIndiceRua(idx){
+  // idx é 0-based (0 = primeira rua real, ex. "01")
+  if(idx<3) return "alimentos";          // ruas 01-03
+  if(idx<7) return "cosmeticos";         // ruas 04-07 (Área Segregada Saúde)
+  if(idx===7) return "quarentena";       // rua 08 (metade quarentena/metade saneantes — ver nota)
+  if(idx>=27 && idx<=28) return "altoValor"; // ruas ~28-29, bolsão Alto Valor
+  return "semInteresse";                 // ruas 09+ (maioria do galpão)
+}
+
+/* =========================================================================
+   ALERTA PREDITIVO DE VALIDADE
+   Em vez de só marcar "vencido" quando já venceu, calculamos quantos dias
+   faltam para o vencimento e classificamos em faixas de risco. Aceita datas
+   em formato DD/MM/AAAA ou AAAA-MM-DD (cobre os formatos mais comuns de
+   planilha/ERP brasileiro).
+   ========================================================================= */
+// helper tolerante: aceita true, "true", "TRUE", 1, "1" como verdadeiro
+// (dados reais de planilha/ERP às vezes não vêm como booleano estrito)
+function isTruthy(v){
+  if(v === true || v === 1) return true;
+  if(typeof v === "string") return v.trim().toLowerCase() === "true" || v.trim() === "1";
+  return false;
+}
+function parseValidade(str){
+  if(!str) return null;
+  const s = String(str).trim();
+  let d;
+  if(/^\d{4}-\d{2}-\d{2}/.test(s)){
+    d = new Date(s.slice(0,10) + "T00:00:00");
+  } else if(/^\d{1,2}\/\d{1,2}\/\d{2,4}$/.test(s)){
+    const [dd,mm,yy] = s.split("/").map(Number);
+    d = new Date(yy < 100 ? 2000+yy : yy, mm-1, dd);
+  } else {
+    return null;
+  }
+  return isNaN(d.getTime()) ? null : d;
+}
+const MS_DIA = 86400000;
+function diasParaVencer(validadeStr, hoje){
+  const d = parseValidade(validadeStr);
+  if(!d) return null;
+  return Math.round((d.getTime() - hoje.getTime()) / MS_DIA);
+}
+// classifica um item em: "vencido" | "critico" (<=7d) | "atencao" (<=15d) | null (ok/sem data)
+function riscoValidadeItem(it, hoje){
+  if(isTruthy(it[6])) return "vencido"; // já vencido conforme flag do sistema
+  const dias = diasParaVencer(it[5], hoje);
+  if(dias === null) return null;
+  if(dias < 0) return "vencido";
+  if(dias <= 7) return "critico";
+  if(dias <= 15) return "atencao";
+  return null;
+}
+// pior risco entre os itens de uma posição
+function riscoValidadePosicao(itens, hoje){
+  let pior = null;
+  const ordem = { vencido:3, critico:2, atencao:1 };
+  itens.forEach(it=>{
+    const r = riscoValidadeItem(it, hoje);
+    if(r && (!pior || ordem[r] > ordem[pior])) pior = r;
+  });
+  return pior;
+}
+
+/* =========================================================================
+   IMPORTAÇÃO DE PLANILHA DO ERP (.xls / .xlsx / .csv)
+   O usuário seleciona o arquivo que sempre sobe pra atualizar o saldo; aqui a
+   gente lê ele no próprio navegador (via SheetJS) e converte cada linha
+   (item/lote) para o formato que o app já usa: um array de POSIÇÕES, cada
+   uma com sua lista de itens.
+   ========================================================================= */
+// aceita "Sim"/"S" (com ou sem acento/maiúscula) como verdadeiro
+function isSimOuS(v){
+  return String(v||"").trim().toLowerCase().startsWith("s");
+}
+// converte célula de data (Date do SheetJS ou texto) para "AAAA-MM-DD".
+// A planilha do ERP exporta datas no padrão americano MM/DD/AAAA (confirmado
+// pelos exemplos com dia > 12, ex.: 10/31/2026), por isso a leitura de texto
+// assume MM/DD/AAAA. Se um dia vier trocado, é só avisar que eu ajusto.
+function erpDateToIso(val){
+  if(val instanceof Date && !isNaN(val)){
+    const y=val.getFullYear(), m=String(val.getMonth()+1).padStart(2,"0"), d=String(val.getDate()).padStart(2,"0");
+    return y+"-"+m+"-"+d;
+  }
+  const s = String(val||"").trim();
+  if(!s) return "";
+  let m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})/); // MM/DD/AAAA
+  if(m) return m[3]+"-"+m[1].padStart(2,"0")+"-"+m[2].padStart(2,"0");
+  m = s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/); // já em ISO
+  if(m) return m[1]+"-"+m[2].padStart(2,"0")+"-"+m[3].padStart(2,"0");
+  return "";
+}
+// extrai o primeiro número de um texto (ex.: " '11" -> 11)
+function parseIntLoose(v){
+  const m = String(v||"").match(/\d+/);
+  return m ? parseInt(m[0],10) : 0;
+}
+// junta as linhas (uma por item/lote) em posições, no formato { pos, rua,
+// col, niv, giro, itens:[[...]] } que o resto do app já espera
+function convertErpRowsToPositions(rows){
+  const byPos = new Map();
+  rows.forEach(row=>{
+    const posId = String(row["id_posicao"]||"").trim();
+    if(!posId) return;
+    let rua = String(row["pratel_en"]||"").trim();
+    let col = parseIntLoose(row["coluna_en"]);
+    let niv = parseIntLoose(row["altura_en"]);
+    if(!rua || !col || !niv){
+      const parts = posId.split(".");
+      if(parts.length>=3){
+        rua = rua || parts[0];
+        col = col || parseInt(parts[1],10) || 0;
+        niv = niv || parseInt(parts[2],10) || 0;
+      }
+    }
+    const diasSemMov = parseFloat(row["Dias sem Mov Fiscal"]) || 0;
+    const giroScore = Math.min(1, diasSemMov/365); // >=365 dias parado = giro 1 (bem lento)
+    const item = [
+      String(row["cod_cli"]||"").trim(),         // cliente
+      String(row["Codigo"]||"").trim(),           // codigo
+      String(row["descricao"]||"").trim(),        // desc
+      parseFloat(row["Qtde"]) || 0,                // qtde
+      String(row["cod_lot_fm"]||"").trim(),        // lote
+      erpDateToIso(row["dat_val_fm"]),             // validade (ISO)
+      false,                                        // vencido: calculado pelo app a partir da validade
+      isSimOuS(row["Perecivel"]),                  // perecivel
+      isSimOuS(row["Danificado"]),                 // danificado
+      giroScore,                                    // giroScore
+      String(row["Familia"]||"").trim()             // familia (BRINDE, VESTUARIO, DISPLAY, PRODUTO, GRÁFICO...)
+    ];
+    if(!byPos.has(posId)) byPos.set(posId, { pos:posId, rua, col, niv, itens:[], _giroSum:0, _giroCount:0 });
+    const p = byPos.get(posId);
+    p.itens.push(item);
+    p._giroSum += giroScore;
+    p._giroCount++;
+  });
+  return Array.from(byPos.values()).map(p=>({
+    pos:p.pos, rua:p.rua, col:p.col, niv:p.niv,
+    giro: p._giroCount ? p._giroSum/p._giroCount : 0,
+    itens: p.itens
+  }));
+}
+// lê o arquivo selecionado (.xls/.xlsx/.csv) e devolve o array de posições pronto
+async function readErpFile(file){
+  const buf = await file.arrayBuffer();
+  const wb = XLSX.read(buf, { type:"array", cellDates:true });
+  const sheet = wb.Sheets[wb.SheetNames[0]];
+  const rows = XLSX.utils.sheet_to_json(sheet, { defval:"", raw:true });
+  const positions = convertErpRowsToPositions(rows);
+  if(!positions.length) throw new Error("Nenhuma posição válida encontrada nessa planilha.");
+  return positions;
+}
+
+/* =========================================================================
+   IA DO ESTOQUE (Gemini, grátis)
+   Em vez de mandar o estoque inteiro (pode ter dezenas de milhares de itens)
+   pro modelo, a gente manda um RESUMO agregado (totais, top clientes, ruas)
+   mais, se a pergunta citar uma posição ou código de cliente específico, os
+   dados detalhados só daquele recorte. Isso mantém a resposta rápida e
+   barata mesmo no plano gratuito.
+   ========================================================================= */
+function buildEstoqueSummary(data){
+  const hoje = new Date(); hoje.setHours(0,0,0,0);
+  let totalItens = 0, vencidos = 0, criticos = 0, atencao = 0, danificados = 0;
+  const porCliente = new Map();
+  const porRua = new Map(); // rua -> { posicoesOcupadas, itens, vencidos, criticos, atencao, danificados }
+  data.forEach(p=>{
+    if(!porRua.has(p.rua)) porRua.set(p.rua, { rua:p.rua, posicoesOcupadas:0, itens:0, vencidos:0, criticos:0, atencao:0, danificados:0 });
+    const r = porRua.get(p.rua);
+    r.posicoesOcupadas++;
+    p.itens.forEach(it=>{
+      totalItens++;
+      r.itens++;
+      const obj = itemToObj(it);
+      const cli = String(obj.cliente||"").trim() || "(sem cliente)";
+      if(!porCliente.has(cli)) porCliente.set(cli, { cliente:cli, itens:0, qtde:0, vencidos:0, danificados:0, ruas:new Set() });
+      const c = porCliente.get(cli);
+      c.itens++; c.qtde += Number(obj.qtde)||0; c.ruas.add(p.rua);
+      const risco = riscoValidadeItem(it, hoje);
+      if(risco === "vencido"){ vencidos++; c.vencidos++; r.vencidos++; }
+      else if(risco === "critico"){ criticos++; r.criticos++; }
+      else if(risco === "atencao"){ atencao++; r.atencao++; }
+      if(isTruthy(obj.danificado)){ danificados++; c.danificados++; r.danificados++; }
+    });
+  });
+  // ranking de clientes: por volume de itens, e separado por quem tem mais problemas
+  // (isso deixa a IA capaz de responder perguntas de priorização sem precisar do detalhe item a item)
+  const clientesArr = Array.from(porCliente.values()).map(c=>({ ...c, ruas: Array.from(c.ruas) }));
+  const topClientesPorQtdItens = [...clientesArr].sort((a,b)=>b.itens-a.itens).slice(0,20);
+  const topClientesPorVencidos = [...clientesArr].filter(c=>c.vencidos>0).sort((a,b)=>b.vencidos-a.vencidos).slice(0,15);
+  const topClientesPorDanificados = [...clientesArr].filter(c=>c.danificados>0).sort((a,b)=>b.danificados-a.danificados).slice(0,15);
+  const ruasArr = Array.from(porRua.values());
+  const ruasComMaisAlertas = [...ruasArr].sort((a,b)=>(b.vencidos+b.criticos+b.danificados)-(a.vencidos+a.criticos+a.danificados)).slice(0,15);
+  return {
+    totalPosicoes: data.length, totalItens, totalClientes: porCliente.size,
+    itensVencidos: vencidos, itensVenceEm7Dias: criticos, itensVenceEm15Dias: atencao,
+    itensDanificados: danificados,
+    topClientesPorQtdItens, topClientesPorVencidos, topClientesPorDanificados,
+    posicoesOcupadasPorRua: ruasArr.map(r=>({ rua:r.rua, posicoesOcupadas:r.posicoesOcupadas })),
+    ruasComMaisAlertas
+  };
+}
+// se a pergunta citar um código de posição ou de cliente que existe nos
+// dados, devolve só aquele recorte (evita ter que mandar tudo). A busca é
+// tolerante: aceita token parcial/contido no nome do cliente, não só igualdade
+// exata, para a IA conseguir responder mesmo quando a pergunta usa parte do
+// nome, abreviação ou minúsculas.
+function findRelevantSlice(data, question){
+  const qUpper = String(question||"").toUpperCase();
+  const tokens = qUpper.match(/[A-Z0-9.\-]{2,}/g) || [];
+  if(!tokens.length) return null;
+  const tokenSet = new Set(tokens);
+
+  // 1) match exato de código de posição
+  const posMatches = data.filter(p=>tokenSet.has(String(p.pos).toUpperCase()));
+  if(posMatches.length){
+    return { tipo:"posicoes", dados: posMatches.slice(0,15).map(p=>({
+      pos:p.pos, rua:p.rua, col:p.col, niv:p.niv, itens:p.itens.map(itemToObj)
+    })) };
+  }
+
+  // 2) match de rua específica (ex.: "rua 5", "corredor A")
+  const ruaTokenMatch = qUpper.match(/\b(?:RUA|CORREDOR)\s+([A-Z0-9]{1,4})\b/);
+  if(ruaTokenMatch){
+    const ruaAlvo = ruaTokenMatch[1];
+    const posDaRua = data.filter(p=>String(p.rua).toUpperCase()===ruaAlvo);
+    if(posDaRua.length){
+      return { tipo:"itensDaRua", dados: posDaRua.slice(0,40).map(p=>({
+        pos:p.pos, col:p.col, niv:p.niv, itens:p.itens.map(itemToObj)
+      })) };
+    }
+  }
+
+  // 3) match de cliente: primeiro tenta igualdade exata do nome inteiro do
+  // cliente com algum token da pergunta; se não achar nada, tenta match
+  // parcial (nome do cliente contém o token, ou vice-versa)
+  const clienteMatches = [];
+  data.forEach(p=>{
+    p.itens.forEach(it=>{
+      const obj = itemToObj(it);
+      const cliUpper = String(obj.cliente||"").toUpperCase().trim();
+      if(!cliUpper) return;
+      if(tokenSet.has(cliUpper)){
+        clienteMatches.push({ pos:p.pos, rua:p.rua, ...obj });
+      }
+    });
+  });
+  if(clienteMatches.length) return { tipo:"itensDoCliente", dados: clienteMatches.slice(0,80) };
+
+  const clienteParcial = [];
+  const tokensLongos = tokens.filter(t=>t.length>=3);
+  if(tokensLongos.length){
+    data.forEach(p=>{
+      p.itens.forEach(it=>{
+        const obj = itemToObj(it);
+        const cliUpper = String(obj.cliente||"").toUpperCase().trim();
+        if(!cliUpper) return;
+        if(tokensLongos.some(t=>cliUpper.includes(t) || t.includes(cliUpper))){
+          clienteParcial.push({ pos:p.pos, rua:p.rua, ...obj });
+        }
+      });
+    });
+  }
+  if(clienteParcial.length) return { tipo:"itensDoClienteAproximado", dados: clienteParcial.slice(0,80) };
+
+  // 4) match de lote/código de item (campo "codigo" ou "lote" do item)
+  const codigoMatches = [];
+  data.forEach(p=>{
+    p.itens.forEach(it=>{
+      const obj = itemToObj(it);
+      const cod = String(obj.codigo||"").toUpperCase();
+      const lote = String(obj.lote||"").toUpperCase();
+      if((cod && tokenSet.has(cod)) || (lote && tokenSet.has(lote))){
+        codigoMatches.push({ pos:p.pos, rua:p.rua, ...obj });
+      }
+    });
+  });
+  if(codigoMatches.length) return { tipo:"itensPorCodigoOuLote", dados: codigoMatches.slice(0,40) };
+
+  return null;
+}
+// tenta vários modelos do Gemini em sequência: se um não existir/estiver
+// indisponível (ex.: descontinuado), cai pro próximo automaticamente
+const GEMINI_MODEL_CANDIDATES = [
+  "gemini-2.5-flash",
+  "gemini-2.5-flash-lite",
+  "gemini-3-flash-preview",
+  "gemini-3.1-flash-lite",
+  "gemini-3.5-flash"
+];
+// chamada crua ao Gemini, com fallback entre modelos — compartilhada pelo
+// chat e pela análise estruturada, pra não duplicar a lógica de retry
+async function chamarGemini(apiKey, promptText, opts){
+  opts = opts || {};
+  let lastError = null;
+  for(const model of GEMINI_MODEL_CANDIDATES){
+    try{
+      const res = await fetch(
+        "https://generativelanguage.googleapis.com/v1beta/models/" + model + ":generateContent",
+        {
+          method: "POST",
+          headers: { "Content-Type":"application/json", "x-goog-api-key": apiKey },
+          body: JSON.stringify({ contents: [{ parts: [{ text: promptText }] }],
+            generationConfig: { temperature: opts.temperature!=null?opts.temperature:0.3,
+              maxOutputTokens: opts.maxOutputTokens || 1536,
+              responseMimeType: opts.json ? "application/json" : undefined } })
+        }
+      );
+      if(!res.ok){ lastError = model + ": HTTP " + res.status; continue; }
+      const json = await res.json();
+      const text = json && json.candidates && json.candidates[0] && json.candidates[0].content &&
+        json.candidates[0].content.parts && json.candidates[0].content.parts[0] &&
+        json.candidates[0].content.parts[0].text;
+      if(text) return { text, model };
+      lastError = model + ": resposta vazia";
+    }catch(e){
+      lastError = model + ": " + (e.message||e);
+    }
+  }
+  throw new Error("Nenhum modelo do Gemini respondeu. Último erro: " + lastError);
+}
+async function askGeminiSobreEstoque(apiKey, question, summary, slice, historico, analiseAtual){
+  const promptText =
+    "Você é um analista sênior de estoque e armazenagem, ajudando o gestor de um galpão a interpretar os " +
+    "dados do sistema. Responda sempre em português do Brasil, de forma direta e útil.\n\n" +
+    "COMO USAR OS DADOS:\n" +
+    "- O RESUMO GERAL cobre o estoque inteiro (totais, ranking de clientes por volume/vencidos/danificados, " +
+    "ocupação e alertas por rua) — use-o para perguntas amplas, comparações, rankings, tendências e contas.\n" +
+    (analiseAtual ? "- Já existe um DIAGNÓSTICO GERADO ANTERIORMENTE (riscos, oportunidades, anomalias e " +
+    "recomendações já levantados) — use-o como pano de fundo pra responder de forma consistente com o que já " +
+    "foi apontado, e cite/aprofunde esses pontos quando a pergunta se relacionar a eles.\n" : "") +
+    "- Quando houver um bloco de DADOS ESPECÍFICOS, ele traz o recorte exato (posição, rua ou cliente) que a " +
+    "pergunta parece estar citando — priorize-o para responder sobre itens, lotes ou posições individuais.\n" +
+    "- Sinta-se livre para cruzar informações, somar, comparar e tirar conclusões práticas (ex.: priorização, " +
+    "riscos, sugestões de ação) em vez de só repetir números soltos.\n" +
+    "- Só diga que não é possível responder se o RESUMO e os DADOS ESPECÍFICOS realmente não cobrirem o que foi " +
+    "perguntado; nesse caso explique rapidamente o que falta, sem inventar números.\n" +
+    "- Formate como lista curta quando ajudar a leitura; senão, poucos parágrafos objetivos.\n\n" +
+    "RESUMO GERAL DO ESTOQUE (JSON):\n" + JSON.stringify(summary) + "\n\n" +
+    (analiseAtual ? "DIAGNÓSTICO JÁ GERADO ANTERIORMENTE (JSON):\n" + JSON.stringify({
+      resumoExecutivo: analiseAtual.resumoExecutivo, riscosCriticos: analiseAtual.riscosCriticos,
+      oportunidades: analiseAtual.oportunidades, anomalias: analiseAtual.anomalias,
+      recomendacoes: analiseAtual.recomendacoes }) + "\n\n" : "") +
+    (slice ? "DADOS ESPECÍFICOS RELACIONADOS À PERGUNTA (JSON):\n" + JSON.stringify(slice) + "\n\n" : "") +
+    (historico && historico.length ? "HISTÓRICO RECENTE DA CONVERSA:\n" + historico.map(m=>
+      (m.role==="user" ? "Usuário: " : "Você: ") + m.text).join("\n") + "\n\n" : "") +
+    "PERGUNTA ATUAL: " + question;
+  return chamarGemini(apiKey, promptText, { temperature:0.3, maxOutputTokens:1536 });
+}
+
+// -----------------------------------------------------------------------
+// ANÁLISE INTELIGENTE — em vez de esperar uma pergunta, pede pro Gemini
+// varrer o resumo inteiro e devolver um diagnóstico estruturado (JSON),
+// que a UI transforma em cartões: resumo executivo, riscos críticos,
+// oportunidades, anomalias e recomendações práticas e priorizadas.
+// -----------------------------------------------------------------------
+async function gerarAnaliseCompletaIA(apiKey, summary){
+  const promptText =
+    "Você é um consultor sênior de supply chain/WMS contratado pra dar um diagnóstico executivo do estoque " +
+    "de um centro de distribuição, pra ser apresentado à diretoria. Responda SOMENTE com um JSON válido " +
+    "(sem markdown, sem \\`\\`\\`, sem texto fora do JSON), em português do Brasil, no formato exato:\n" +
+    '{"resumoExecutivo":"2-3 frases objetivas sobre a saúde geral do estoque",' +
+    '"riscosCriticos":[{"titulo":"...","detalhe":"...","impacto":"alto|medio|baixo"}],' +
+    '"oportunidades":[{"titulo":"...","detalhe":"..."}],' +
+    '"anomalias":[{"titulo":"...","detalhe":"..."}],' +
+    '"recomendacoes":[{"acao":"...","motivo":"...","prioridade":"alta|media|baixa"}]}\n\n' +
+    "Regras:\n" +
+    "- Baseie-se SOMENTE nos números do RESUMO abaixo — não invente dados que não estão ali.\n" +
+    "- riscosCriticos: itens vencidos/a vencer/danificados que merecem atenção imediata, com números reais.\n" +
+    "- oportunidades: coisas como ruas quase lotadas, clientes concentrando muito volume, otimização de espaço.\n" +
+    "- anomalias: padrões estranhos nos dados (ex.: rua com alerta desproporcional, cliente só com problemas).\n" +
+    "- recomendacoes: 3 a 6 ações práticas e priorizadas, específicas o bastante pra alguém executar.\n" +
+    "- 3 a 6 itens em cada lista (menos se os dados não sustentarem mais que isso). Nunca deixe uma lista vazia " +
+    "se houver QUALQUER dado relevante no resumo; só deixe vazia se genuinamente não houver nada a reportar " +
+    "naquela categoria.\n\n" +
+    "RESUMO GERAL DO ESTOQUE (JSON):\n" + JSON.stringify(summary);
+
+  const { text, model } = await chamarGemini(apiKey, promptText, { temperature:0.25, maxOutputTokens:2400, json:true });
+  const cleaned = text.replace(/^```json\s*|\s*```$/g, "").trim();
+  let parsed;
+  try{ parsed = JSON.parse(cleaned); }
+  catch(e){ throw new Error("A IA respondeu num formato inesperado. Tente novamente."); }
+  return { analise: parsed, model };
+}
+
+/* =========================================================================
+   CLASSIFICAÇÃO: posições reais do galpão x posições fictícias/irregulares
+   Regra: uma rua é considerada fictícia quando (a) o nome não é composto só
+   por letras (ex.: "17") ou (b) sua maior coluna é muito menor que a mediana
+   das demais ruas (ex.: "PI", que só vai até a coluna 12 enquanto o padrão
+   do galpão vai até ~73/74). Além disso, posições isoladas cuja coluna foge
+   muito do padrão dentro de uma rua real (ex.: "T.878.1") são destacadas
+   como "extravio" e também vão para o bloco fictício.
+   ========================================================================= */
+function classifyEstoque(data){
+  const byRua = new Map();
+  data.forEach(pos=>{
+    if(!byRua.has(pos.rua)) byRua.set(pos.rua, []);
+    byRua.get(pos.rua).push(pos);
+  });
+  const ruaNames = Array.from(byRua.keys());
+  const maxCols  = ruaNames.map(r => Math.max(...byRua.get(r).map(p=>p.col)));
+  const sortedMaxCols = [...maxCols].sort((a,b)=>a-b);
+  const median = sortedMaxCols[Math.floor(sortedMaxCols.length/2)] || 1;
+  const smallRuaThreshold   = median * 0.5;
+  const outlierColThreshold = median * 2.5;
+
+  // Em vez de assumir que "rua real = só letras" (isso varia de galpão pra
+  // galpão — aqui é o CONTRÁRIO: ruas reais são numéricas 01-32, e as
+  // fictícias/irregulares usam letras: FR, SAC, HNK, AF...), detectamos
+  // dinamicamente qual dos dois padrões de nome concentra a maior parte das
+  // POSIÇÕES reais do estoque, e tratamos esse como o padrão "real".
+  const isNumeric = name => /^\d+$/.test(name);
+  let posicoesNumericas = 0, posicoesAlfa = 0;
+  ruaNames.forEach(name=>{
+    const n = byRua.get(name).length;
+    if(isNumeric(name)) posicoesNumericas += n; else posicoesAlfa += n;
+  });
+  const padraoRealENumerico = posicoesNumericas >= posicoesAlfa;
+
+  const realNames = [], ficticiaNames = [];
+  ruaNames.forEach(name=>{
+    const maxCol = Math.max(...byRua.get(name).map(p=>p.col));
+    const seguePadrao = isNumeric(name) === padraoRealENumerico;
+    if(!seguePadrao || maxCol < smallRuaThreshold) ficticiaNames.push(name);
+    else realNames.push(name);
+  });
+  const ficticiaSet = new Set(ficticiaNames);
+
+  const realPositions = [], ficticiaPositions = [], outlierPositions = [];
+  data.forEach(pos=>{
+    if(ficticiaSet.has(pos.rua)) ficticiaPositions.push(pos);
+    else if(pos.col > outlierColThreshold) outlierPositions.push(pos);
+    else realPositions.push(pos);
+  });
+
+  // reindexa as posições "extraviadas" numa rua sintética própria, dentro
+  // de uma faixa de coluna sensata, preservando a posição original para exibição
+  const extraviadas = outlierPositions.map((p,i)=>({
+    ...p, origPos: p.pos, rua: "EXTRAVIO", col: i+1, niv: 1
+  }));
+
+  const sortRuaNames = arr => [...arr].sort((a,b)=> a.length - b.length || (a<b?-1:a>b?1:0));
+
+  return {
+    realRuas: sortRuaNames(realNames),
+    ficticiaRuas: sortRuaNames(ficticiaNames).concat(extraviadas.length ? ["EXTRAVIO"] : []),
+    realPositions,
+    ficticiaPositions: ficticiaPositions.concat(extraviadas)
+  };
+}
+
+/* =========================================================================
+   MONTAGEM DOS CORREDORES (par esquerda/direita)
+   A primeira rua da sequência ocupa somente o lado direito do primeiro
+   corredor (ex.: rua "A" só tem lado direito), depois seguem pares normais.
+   ========================================================================= */
+function buildCorridors(orderedRuas){
+  const corridors = [];
+  if(!orderedRuas.length) return corridors;
+  corridors.push({ left: null, right: orderedRuas[0] });
+  for(let i=1; i<orderedRuas.length; i+=2){
+    corridors.push({ left: orderedRuas[i], right: orderedRuas[i+1] !== undefined ? orderedRuas[i+1] : null });
+  }
+  return corridors;
+}
+
+function buildBlockLayout(orderedRuas, positions, originX){
+  const corridors = buildCorridors(orderedRuas);
+  const maxColByRua = {}, maxLevelByRua = {};
+  positions.forEach(p=>{
+    maxColByRua[p.rua]   = Math.max(maxColByRua[p.rua]   || 0, p.col);
+    maxLevelByRua[p.rua] = Math.max(maxLevelByRua[p.rua] || 0, p.niv);
+  });
+  const corridorSpanX = AISLE_WIDTH + RACK_DEPTH*2 + CORRIDOR_GAP;
+  const ruaX = {};
+  const ruaFaceDir = {}; // +1 = corredor fica do lado +X da rua · -1 = do lado -X
+  corridors.forEach((c,i)=>{
+    const centerX = originX + i*corridorSpanX;
+    if(c.left)  { ruaX[c.left]  = centerX - AISLE_WIDTH/2 - RACK_DEPTH/2; ruaFaceDir[c.left]  = +1; }
+    if(c.right) { ruaX[c.right] = centerX + AISLE_WIDTH/2 + RACK_DEPTH/2; ruaFaceDir[c.right] = -1; }
+  });
+  const maxColOverall = Math.max(1, ...orderedRuas.map(r=>maxColByRua[r]||0));
+  const totalWidth = corridors.length * corridorSpanX;
+  const totalDepth = maxColOverall * COL_SPACING;
+  return { ruas: orderedRuas, corridors, ruaX, ruaFaceDir, maxColByRua, maxLevelByRua,
+           corridorSpanX, totalWidth, totalDepth, maxColOverall, originX, positions };
+}
+
+// Posições vazias: para cada rua do bloco, gera as combinações col x nível
+// que aparecem na grade mas não têm registro de item no estoque.json.
+// (aproximação: assume grade cheia col x nível por rua, já que o arquivo só lista posições ocupadas)
+function computeEmptySlots(layout){
+  // usa (rua,col,niv) em vez da string "pos" para não ser enganado por
+  // pequenas inconsistências de formatação no arquivo de origem (ex.: "PI.08.1" vs "PI.08.01")
+  const occupied = new Set(layout.positions.map(p=>p.rua+"|"+p.col+"|"+p.niv));
+  const empties = [];
+  layout.ruas.forEach(rua=>{
+    const maxCol = layout.maxColByRua[rua] || 0;
+    const maxNiv = layout.maxLevelByRua[rua] || 0;
+    for(let col=1; col<=maxCol; col++){
+      for(let niv=1; niv<=maxNiv; niv++){
+        if(!occupied.has(rua+"|"+col+"|"+niv)){
+          const pos = rua + "." + String(col).padStart(2,"0") + "." + niv;
+          empties.push({ pos, rua, col, niv });
+        }
+      }
+    }
+  });
+  return empties;
+}
+
+/* =========================================================================
+   PAINEL DE DETALHES DE UMA POSIÇÃO
+   ========================================================================= */
+function DetailPanel({ selected, onClose }){
+  if(!selected) return null;
+  const itens = selected.itens.map(itemToObj);
+  return h("div", {
+    style: { position:"absolute", top:0, right:0, width:360, maxWidth:"90vw", height:"100%",
+      background:"rgba(17,20,23,0.97)", color:"#f4efe6", padding:"20px 18px", overflowY:"auto",
+      boxShadow:"-8px 0 24px rgba(0,0,0,0.4)", fontFamily:"'Inter', system-ui, sans-serif",
+      borderLeft:"1px solid rgba(232,161,58,0.25)", zIndex:20 } },
+    h("div", { style:{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:4 } },
+      h("h2", { style:{ margin:0, fontSize:20, fontFamily:"'JetBrains Mono', monospace", color:"#e8a13a" } }, selected.pos),
+      h("button", { onClick:onClose, style:{ background:"none", border:"none", color:"#a8a29a", fontSize:22, cursor:"pointer", lineHeight:1 } }, "\xD7")
+    ),
+    selected.origPos && h("p", { style:{ margin:"0 0 4px", fontSize:11, color:"#ff8a80" } },
+      "\u26A0 Posição fora do padrão do galpão — original: ", selected.origPos),
+    h("p", { style:{ margin:"2px 0 6px", fontSize:12, color:"#a8a29a" } },
+      "Rua ", selected.rua, " \xB7 Coluna ", selected.col, " \xB7 Nível ", selected.niv, " \u2014 ",
+      itens.length, " ", itens.length===1 ? "lote/SKU" : "lotes/SKUs"),
+    selected.alerta && h("div", { style:{ background:"rgba(192,57,43,0.18)", border:"1px solid rgba(192,57,43,0.5)",
+      borderRadius:6, padding:"6px 10px", fontSize:11, color:"#ff8a80", marginBottom:10 } },
+      "\u26A0 Posição contém item vencido ou danificado"),
+    itens.map((it,idx)=> h("div", { key:idx, style:{
+        borderTop: idx===0 ? "1px solid rgba(255,255,255,0.08)" : "none",
+        borderBottom:"1px solid rgba(255,255,255,0.08)", padding:"10px 0", fontSize:13 } },
+      h("div", { style:{ display:"flex", justifyContent:"space-between", marginBottom:4, alignItems:"center" } },
+        h("span", { style:{ background:"#3a4550", color:"#f4efe6", fontWeight:700, fontSize:11, padding:"1px 6px", borderRadius:4 } }, it.cliente),
+        h("span", { style:{ color:"#a8a29a", fontFamily:"'JetBrains Mono', monospace", fontSize:11 } }, it.codigo)
+      ),
+      h("div", { style:{ marginBottom:4, lineHeight:1.35 } }, it.desc),
+      h("div", { style:{ display:"flex", gap:12, flexWrap:"wrap", color:"#a8a29a", fontSize:11, marginBottom:4 } },
+        h("span", null, "Qtd: ", h("strong", { style:{ color:"#f4efe6" } }, it.qtde)),
+        h("span", null, "Lote: ", it.lote || "\u2014"),
+        h("span", null, "Val: ", it.validade || "\u2014"),
+        it.familia && h("span", null, "Família: ", it.familia)
+      ),
+      h("div", { style:{ display:"flex", gap:6, flexWrap:"wrap" } },
+        isTruthy(it.vencido) && h("span", { style:{ fontSize:10, background:"rgba(192,57,43,0.25)", color:"#ff8a80", padding:"1px 6px", borderRadius:4 } }, "VENCIDO"),
+        isTruthy(it.danificado) && h("span", { style:{ fontSize:10, background:"rgba(192,57,43,0.25)", color:"#ff8a80", padding:"1px 6px", borderRadius:4 } }, "DANIFICADO"),
+        isTruthy(it.perecivel) && h("span", { style:{ fontSize:10, background:"rgba(41,128,185,0.25)", color:"#8ecff5", padding:"1px 6px", borderRadius:4 } }, "PERECÍVEL"),
+        (()=>{
+          if(isTruthy(it.vencido)) return null; // já mostrado acima
+          const dias = diasParaVencer(it.validade, new Date(new Date().setHours(0,0,0,0)));
+          if(dias === null || dias > 15) return null;
+          const cor = dias <= 7 ? { bg:"rgba(255,140,26,0.22)", fg:"#ffb066" } : { bg:"rgba(240,196,25,0.2)", fg:"#f0d060" };
+          return h("span", { style:{ fontSize:10, background:cor.bg, color:cor.fg, padding:"1px 6px", borderRadius:4 } },
+            "VENCE EM ", dias, "D");
+        })()
+      )
+    ))
+  );
+}
+
+/* =========================================================================
+   DADOS INSTITUCIONAIS DO GALPÃO
+   Extraídos do projeto aprovado pela Vigilância Sanitária de Barueri/SP
+   (Processo PMB 059627/2026, Laudo Técnico de Avaliação - Portaria CVS 10/2017).
+   São dados descritivos do imóvel (não da planilha de estoque) — mantidos
+   separados como referência institucional/regulatória do prédio.
+   ========================================================================= */
+const GALPAO_INFO = {
+  razaoSocial: "PS Logística e Promoções Armazéns Gerais Ltda.",
+  endereco: "Av. Jussara, nº 510 — Galpões 7, 8, 9 e 10, Jardim Santa Cecília, Barueri/SP — CEP 06465-070",
+  atividade: "Depósito de mercadorias para terceiros, exceto armazéns gerais e guarda-móveis (CNAE 5211-7/99)",
+  processo: "PMB 059627/2026 — Laudo Técnico de Avaliação (Portaria CVS 10/2017), rev06",
+  areas: [
+    { label:"Galpão", valor:"7.147,75 m²" },
+    { label:"Doca", valor:"941,70 m²" },
+    { label:"Mezanino", valor:"756,45 m²" },
+    { label:"Total construído", valor:"8.845,90 m²" }
+  ],
+  docas: "12 docas (Doca 01 a Doca 12) ao longo da fachada de recebimento/expedição, com mezanino administrativo de apoio acima",
+  fluxos: [
+    { nome:"Alimentos", cor:"#2e8b57" },
+    { nome:"Cosméticos", cor:"#c9781f" },
+    { nome:"Saneantes", cor:"#2255aa" },
+    { nome:"Produtos sem interesse à saúde", cor:"#4fd1c5" },
+    { nome:"Quarentena", cor:"#c2298a" },
+    { nome:"Não conformes", cor:"#c0392b" },
+    { nome:"Produtos inflamáveis", cor:"#8a2be2" }
+  ],
+  nota: "A circulação de empilhadeiras ocorre exclusivamente nos corredores operacionais entre as estruturas porta-paletes, conforme indicado em projeto. As faixas de zona no piso e a área frontal (docas, recebimento, expedição, separação/conferência/embalagem e a área 'Blocado') foram lidas diretamente da planta oficial em alta resolução — ordem das ruas, nomes e posições relativas conferem com o desenho. Ainda assim, a amarração exata posição-a-posição com o WMS não está confirmada, e o traçado interno fino (como os limites exatos entre Alimentos/Não Conformes dentro das ruas 01-03) é aproximado."
+};
+
+function InfoGalpaoPanel({ open, onClose, isMobile }){
+  if(!open) return null;
+  return h("div", {
+    style:{ position:"absolute", top:0, left:0, width:340, maxWidth:"90vw", height:"100%",
+      background:"rgba(17,20,23,0.97)", color:"#f4efe6", padding:"20px 18px", overflowY:"auto",
+      boxShadow:"8px 0 24px rgba(0,0,0,0.4)", fontFamily:"'Inter', system-ui, sans-serif",
+      borderRight:"1px solid rgba(142,207,245,0.25)", zIndex:20, fontSize:12.5, lineHeight:1.5 }
+  },
+    h("div", { style:{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:6 } },
+      h("h2", { style:{ margin:0, fontSize:16, color:"#8ecff5" } }, "\u2139\uFE0F Dados do galpão"),
+      h("button", { onClick:onClose, style:{ background:"none", border:"none", color:"#a8a29a", fontSize:20, cursor:"pointer", lineHeight:1 } }, "\xD7")
+    ),
+    h("p", { style:{ margin:"0 0 10px", fontSize:10.5, color:"#6b6f74" } },
+      "Fonte: projeto aprovado pela Vigilância Sanitária de Barueri/SP — Processo ", GALPAO_INFO.processo, "."),
+
+    h("div", { style:{ marginBottom:12 } },
+      h("strong", { style:{ color:"#e8a13a" } }, GALPAO_INFO.razaoSocial),
+      h("p", { style:{ margin:"4px 0" } }, GALPAO_INFO.endereco),
+      h("p", { style:{ margin:"4px 0", color:"#a8a29a" } }, GALPAO_INFO.atividade)
+    ),
+
+    h("div", { style:{ marginBottom:12 } },
+      h("div", { style:{ fontWeight:700, marginBottom:4, color:"#f4efe6" } }, "Áreas construídas"),
+      GALPAO_INFO.areas.map(a => h("div", { key:a.label, style:{ display:"flex", justifyContent:"space-between",
+        padding:"3px 0", borderBottom:"1px solid rgba(255,255,255,0.06)" } },
+        h("span", { style:{ color:"#a8a29a" } }, a.label), h("span", null, a.valor)))
+    ),
+
+    h("div", { style:{ marginBottom:12 } },
+      h("div", { style:{ fontWeight:700, marginBottom:4, color:"#f4efe6" } }, "Docas"),
+      h("p", { style:{ margin:0, color:"#a8a29a" } }, GALPAO_INFO.docas)
+    ),
+
+    h("div", { style:{ marginBottom:12 } },
+      h("div", { style:{ fontWeight:700, marginBottom:4, color:"#f4efe6" } }, "Zonas de produto (planta oficial)"),
+      GALPAO_INFO.fluxos.map(f => h("div", { key:f.nome, style:{ display:"flex", alignItems:"center", gap:6, padding:"2px 0" } },
+        h("span", { style:{ width:10, height:10, borderRadius:2, background:f.cor, flex:"0 0 auto" } }),
+        h("span", null, f.nome)))
+    ),
+
+    h("p", { style:{ margin:0, fontSize:10.5, color:"#6b6f74", fontStyle:"italic" } }, GALPAO_INFO.nota),
+
+    h("p", { style:{ margin:"12px 0 0", fontSize:10, color:"#4a4e53" } },
+      "Observação: esta planta descreve o prédio para fins de licenciamento sanitário — a numeração de rua/coluna/nível mostrada no mapa 3D vem da planilha de estoque (WMS), não deste documento.")
+  );
+}
+
+const IMPACTO_COR = { alto:"#e63946", medio:"#e8a13a", baixo:"#4a90a4" };
+const PRIORIDADE_COR = { alta:"#e63946", media:"#e8a13a", baixa:"#4a90a4" };
+
+function AnaliseIAPanel({ open, onClose, isMobile, geminiKey, analise, loading, erro, onGerar }){
+  if(!open) return null;
+  return h("div", {
+    style:{ position:"absolute", top:0, left:0, width:400, maxWidth:"92vw", height:"100%",
+      background:"rgba(17,20,23,0.98)", color:"#f4efe6", padding:"20px 18px", overflowY:"auto",
+      boxShadow:"8px 0 24px rgba(0,0,0,0.4)", fontFamily:"'Inter', system-ui, sans-serif",
+      borderRight:"1px solid rgba(232,161,58,0.3)", zIndex:21, fontSize:12.5, lineHeight:1.5 }
+  },
+    h("div", { style:{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:4 } },
+      h("h2", { style:{ margin:0, fontSize:16, color:"#e8a13a" } }, "\u{1F9E0} Análise Inteligente"),
+      h("button", { onClick:onClose, style:{ background:"none", border:"none", color:"#a8a29a", fontSize:20, cursor:"pointer", lineHeight:1 } }, "\xD7")
+    ),
+    h("p", { style:{ margin:"0 0 12px", fontSize:10.5, color:"#6b6f74" } },
+      "Diagnóstico gerado por IA a partir dos dados atuais do estoque — não substitui a validação de um analista."),
+
+    !geminiKey && h("div", { style:{ fontSize:12, color:"#a8a29a", padding:"10px 0" } },
+      "Configure a chave do Gemini no chat (\u{1F916}) primeiro pra poder gerar a análise."),
+
+    geminiKey && h("button", { onClick:onGerar, disabled:loading, style:{ width:"100%", padding:"9px 12px",
+      borderRadius:8, border:"none", background: loading ? "rgba(232,161,58,0.4)" : "#c9781f", color:"#1c1408",
+      fontSize:13, fontWeight:700, cursor: loading ? "default" : "pointer", marginBottom:14 } },
+      loading ? "Analisando o estoque..." : (analise ? "\u{1F504} Atualizar análise" : "\u2728 Gerar análise agora")),
+
+    erro && h("div", { style:{ fontSize:11, color:"#ff8a80", marginBottom:12, background:"rgba(192,57,43,0.15)",
+      padding:"8px 10px", borderRadius:6 } }, "\u26A0 ", erro),
+
+    !analise && !loading && !erro && h("div", { style:{ fontSize:12, color:"#6b6f74", textAlign:"center", padding:"30px 10px" } },
+      "Nenhuma análise gerada ainda. Clique no botão acima."),
+
+    analise && h(React.Fragment, null,
+      h("div", { style:{ fontSize:10, color:"#6b6f74", marginBottom:10 } },
+        "Gerada em ", new Date(analise.geradaEm).toLocaleString("pt-BR"), analise.model ? " \xB7 " + analise.model : ""),
+
+      h("div", { style:{ background:"rgba(142,207,245,0.08)", border:"1px solid rgba(142,207,245,0.25)",
+        borderRadius:8, padding:"10px 12px", marginBottom:14, fontSize:12.5 } },
+        h("div", { style:{ fontWeight:700, color:"#8ecff5", marginBottom:4 } }, "Resumo executivo"),
+        analise.resumoExecutivo),
+
+      analise.riscosCriticos && analise.riscosCriticos.length>0 && h("div", { style:{ marginBottom:14 } },
+        h("div", { style:{ fontWeight:700, color:"#ff8a80", marginBottom:6 } }, "\u26A0 Riscos críticos"),
+        analise.riscosCriticos.map((r,i)=> h("div", { key:i, style:{ borderLeft:"3px solid "+(IMPACTO_COR[r.impacto]||"#e63946"),
+          background:"rgba(255,255,255,0.04)", padding:"6px 10px", marginBottom:6, borderRadius:4 } },
+          h("div", { style:{ display:"flex", justifyContent:"space-between", alignItems:"center" } },
+            h("strong", null, r.titulo),
+            r.impacto && h("span", { style:{ fontSize:9, textTransform:"uppercase", color:IMPACTO_COR[r.impacto]||"#e63946",
+              border:"1px solid "+(IMPACTO_COR[r.impacto]||"#e63946"), borderRadius:4, padding:"1px 5px" } }, r.impacto)),
+          h("div", { style:{ color:"#a8a29a", marginTop:2 } }, r.detalhe)))
+      ),
+
+      analise.oportunidades && analise.oportunidades.length>0 && h("div", { style:{ marginBottom:14 } },
+        h("div", { style:{ fontWeight:700, color:"#7fd99a", marginBottom:6 } }, "\u{1F4C8} Oportunidades"),
+        analise.oportunidades.map((o,i)=> h("div", { key:i, style:{ borderLeft:"3px solid #2e8b57",
+          background:"rgba(255,255,255,0.04)", padding:"6px 10px", marginBottom:6, borderRadius:4 } },
+          h("strong", null, o.titulo),
+          h("div", { style:{ color:"#a8a29a", marginTop:2 } }, o.detalhe)))
+      ),
+
+      analise.anomalias && analise.anomalias.length>0 && h("div", { style:{ marginBottom:14 } },
+        h("div", { style:{ fontWeight:700, color:"#d9a4ff", marginBottom:6 } }, "\u{1F50D} Anomalias"),
+        analise.anomalias.map((a,i)=> h("div", { key:i, style:{ borderLeft:"3px solid #8a4fb0",
+          background:"rgba(255,255,255,0.04)", padding:"6px 10px", marginBottom:6, borderRadius:4 } },
+          h("strong", null, a.titulo),
+          h("div", { style:{ color:"#a8a29a", marginTop:2 } }, a.detalhe)))
+      ),
+
+      analise.recomendacoes && analise.recomendacoes.length>0 && h("div", { style:{ marginBottom:6 } },
+        h("div", { style:{ fontWeight:700, color:"#e8a13a", marginBottom:6 } }, "\u2705 Recomendações"),
+        analise.recomendacoes.map((rc,i)=> h("div", { key:i, style:{ borderLeft:"3px solid "+(PRIORIDADE_COR[rc.prioridade]||"#e8a13a"),
+          background:"rgba(255,255,255,0.04)", padding:"6px 10px", marginBottom:6, borderRadius:4 } },
+          h("div", { style:{ display:"flex", justifyContent:"space-between", alignItems:"center" } },
+            h("strong", null, rc.acao),
+            rc.prioridade && h("span", { style:{ fontSize:9, textTransform:"uppercase", color:PRIORIDADE_COR[rc.prioridade]||"#e8a13a",
+              border:"1px solid "+(PRIORIDADE_COR[rc.prioridade]||"#e8a13a"), borderRadius:4, padding:"1px 5px" } }, rc.prioridade)),
+          h("div", { style:{ color:"#a8a29a", marginTop:2 } }, rc.motivo)))
+      )
+    )
+  );
+}
+
+const PALLET_HEIGHT = 0.14;
+// quantos "níveis de empilhamento" mostrar, de acordo com quantos lotes/SKUs
+// existem na posição — é uma representação GENÉRICA (não é a caixa real),
+// só pra dar volume visual: pouco material = pouca caixa, muito material = pilha cheia.
+function tierForItemCount(n){
+  if(n<=0) return 0;
+  if(n===1) return 1;
+  if(n<=3) return 2;
+  if(n<=6) return 3;
+  return 4;
+}
+function tierTemplate(tier){
+  if(tier<=0) return [];
+  if(tier===1){
+    const sy=LEVEL_HEIGHT*0.42;
+    return [ {dx:0,dz:0,y0:sy/2, sx:RACK_DEPTH*0.5, sy, sz:COL_SPACING*0.5} ];
+  }
+  if(tier===2){
+    const sy=LEVEL_HEIGHT*0.38;
+    return [
+      {dx:-RACK_DEPTH*0.19, dz:0, y0:sy/2, sx:RACK_DEPTH*0.34, sy, sz:COL_SPACING*0.62},
+      {dx: RACK_DEPTH*0.19, dz:0, y0:sy/2, sx:RACK_DEPTH*0.34, sy, sz:COL_SPACING*0.62}
+    ];
+  }
+  if(tier===3){
+    const sy=LEVEL_HEIGHT*0.34;
+    const out=[];
+    [-1,1].forEach(sx=>[-1,1].forEach(sz=>{
+      out.push({dx:sx*RACK_DEPTH*0.19, dz:sz*COL_SPACING*0.19, y0:sy/2, sx:RACK_DEPTH*0.34, sy, sz:COL_SPACING*0.34});
+    }));
+    return out;
+  }
+  // tier 4: base 2x2 + 2 caixas no topo (pilha "cheia")
+  const sy=LEVEL_HEIGHT*0.32;
+  const out=[];
+  [-1,1].forEach(sx=>[-1,1].forEach(sz=>{
+    out.push({dx:sx*RACK_DEPTH*0.19, dz:sz*COL_SPACING*0.19, y0:sy/2, sx:RACK_DEPTH*0.34, sy, sz:COL_SPACING*0.34});
+  }));
+  [-1,1].forEach(sx=>{
+    out.push({dx:sx*RACK_DEPTH*0.19, dz:0, y0:sy*1.5, sx:RACK_DEPTH*0.34, sy, sz:COL_SPACING*0.6});
+  });
+  return out;
+}
+function tierStackHeight(tier){
+  const slots = tierTemplate(tier);
+  return slots.reduce((m,s)=>Math.max(m, s.y0+s.sy/2), 0.15);
+}
+
+/* =========================================================================
+   COMPONENTE PRINCIPAL
+   ========================================================================= */
+function Armazem3D(){
+  const mountRef = useRef(null);
+  const api = useRef({}); // "ponte" entre React e a cena Three.js
+  const [data, setData] = useState(null);
+  const [error, setError] = useState(null);
+  const [progress, setProgress] = useState(0);
+  const [selected, setSelected] = useState(null);
+  const [viewMode, setViewMode] = useState("orbit"); // "orbit" | "walk"
+  const viewModeRef = useRef(viewMode);
+  viewModeRef.current = viewMode;
+  const [walkInputMode, setWalkInputMode] = useState("mouse"); // "mouse" | "teclado" — só quando viewMode="walk"
+
+  // modo único de visualização: busca livre, cliente, vencidos, danificados ou vazios
+  const [mode, setMode] = useState({ type:"none" });
+  const [searchText, setSearchText] = useState("");
+  // estado da importação manual da planilha do ERP (.xls/.xlsx/.csv)
+  const [importStatus, setImportStatus] = useState(null); // { state:"loading"|"success"|"error", ... }
+  // painel com dados reais do prédio (fonte: projeto de Vigilância Sanitária PMB 059627/2026)
+  const [infoOpen, setInfoOpen] = useState(false);
+
+  // --- responsivo: detecta tela pequena (celular) para adaptar o layout ---
+  const [isMobile, setIsMobile] = useState(()=> typeof window !== "undefined" && window.innerWidth <= 760);
+  const [filtersOpen, setFiltersOpen] = useState(false); // no celular, filtros ficam recolhidos por padrão
+  useEffect(()=>{
+    const onResize = ()=> setIsMobile(window.innerWidth <= 760);
+    window.addEventListener("resize", onResize);
+    return ()=> window.removeEventListener("resize", onResize);
+  }, []);
+
+  const handleErpFileSelected = async (file)=>{
+    if(!file) return;
+    setImportStatus({ state:"loading" });
+    try{
+      const positions = await readErpFile(file);
+      const totalItens = positions.reduce((acc,p)=>acc+p.itens.length, 0);
+      setError(null);
+      setData(positions);
+      setImportStatus({ state:"success", posCount:positions.length, itemCount:totalItens, at:new Date() });
+      // atualizou a planilha? a IA já reestuda os dados na hora sozinha,
+      // sem precisar clicar em nada (usa 'positions' direto, não o estado
+      // 'data' — que ainda não teria atualizado nesse exato instante)
+      if(geminiKey) gerarAnalise(positions);
+    }catch(e){
+      setImportStatus({ state:"error", message: e.message || String(e) });
+    }
+  };
+
+  // --- IA do estoque (Gemini) ---
+  const [geminiKey, setGeminiKey] = useState(()=>{
+    try{ return localStorage.getItem("gemini_api_key") || ""; }catch(e){ return ""; }
+  });
+  const [geminiKeyInput, setGeminiKeyInput] = useState("");
+  const [chatOpen, setChatOpen] = useState(false);
+  // histórico do chat persiste no navegador (localStorage) — assim ele
+  // "lembra" da conversa mesmo depois de fechar e reabrir a aba
+  const [chatMessages, setChatMessages] = useState(()=>{
+    try{ return JSON.parse(localStorage.getItem("estoque_chat_historico")||"[]"); }catch(e){ return []; }
+  }); // { role:"user"|"ia"|"erro", text, model? }
+  const [chatInput, setChatInput] = useState("");
+  const [chatLoading, setChatLoading] = useState(false);
+
+  useEffect(()=>{
+    try{ localStorage.setItem("estoque_chat_historico", JSON.stringify(chatMessages.slice(-60))); }catch(e){}
+  }, [chatMessages]);
+  const limparConversa = ()=>{
+    setChatMessages([]);
+    try{ localStorage.removeItem("estoque_chat_historico"); }catch(e){}
+  };
+
+  // --- Análise Inteligente (diagnóstico automático, não é chat) ---
+  const [analiseOpen, setAnaliseOpen] = useState(false);
+  const [analise, setAnalise] = useState(()=>{
+    try{ return JSON.parse(localStorage.getItem("estoque_analise_ia")||"null"); }catch(e){ return null; }
+  }); // { resumoExecutivo, riscosCriticos[], oportunidades[], anomalias[], recomendacoes[], geradaEm, model }
+  const [analiseLoading, setAnaliseLoading] = useState(false);
+  const [analiseErro, setAnaliseErro] = useState(null);
+  const gerarAnalise = async (dadosOverride)=>{
+    const dadosParaAnalise = dadosOverride || data;
+    if(!geminiKey || analiseLoading || !dadosParaAnalise) return;
+    setAnaliseLoading(true);
+    setAnaliseErro(null);
+    try{
+      const summary = buildEstoqueSummary(dadosParaAnalise);
+      const { analise: resultado, model } = await gerarAnaliseCompletaIA(geminiKey, summary);
+      const comMeta = { ...resultado, geradaEm: new Date().toISOString(), model };
+      setAnalise(comMeta);
+      try{ localStorage.setItem("estoque_analise_ia", JSON.stringify(comMeta)); }catch(e){}
+    }catch(e){
+      setAnaliseErro(e.message || String(e));
+    }finally{
+      setAnaliseLoading(false);
+    }
+  };
+
+  const saveGeminiKey = ()=>{
+    const k = geminiKeyInput.trim();
+    if(!k) return;
+    setGeminiKey(k);
+    try{ localStorage.setItem("gemini_api_key", k); }catch(e){}
+    setGeminiKeyInput("");
+  };
+  const forgetGeminiKey = ()=>{
+    setGeminiKey("");
+    try{ localStorage.removeItem("gemini_api_key"); }catch(e){}
+  };
+  const sendChatMessage = async ()=>{
+    const q = chatInput.trim();
+    if(!q || !geminiKey || chatLoading || !data) return;
+    setChatMessages(m=>[...m, { role:"user", text:q }]);
+    setChatInput("");
+    setChatLoading(true);
+    try{
+      const summary = buildEstoqueSummary(data);
+      const slice = findRelevantSlice(data, q);
+      // manda uma janela maior de histórico agora que ele persiste entre
+      // sessões — dá mais contexto de continuidade pra IA
+      const historico = chatMessages.slice(-16).filter(m=>m.role==="user" || m.role==="ia");
+      const { text, model } = await askGeminiSobreEstoque(geminiKey, q, summary, slice, historico, analise);
+      setChatMessages(m=>[...m, { role:"ia", text, model }]);
+    }catch(e){
+      setChatMessages(m=>[...m, { role:"erro", text: e.message || String(e) }]);
+    }finally{
+      setChatLoading(false);
+    }
+  };
+
+  useEffect(()=>{
+    let cancelled = false;
+    async function load(){
+      try{
+        const res = await fetch("./estoque.json");
+        if(!res.ok) throw new Error("HTTP " + res.status);
+        const len = res.headers.get("Content-Length");
+        const total = len ? parseInt(len,10) : 0;
+        if(!res.body || !total){
+          const json = await res.json();
+          if(!cancelled) setData(json);
+          return;
+        }
+        const reader = res.body.getReader();
+        let received = 0;
+        const chunks = [];
+        for(;;){
+          const { done, value } = await reader.read();
+          if(done) break;
+          chunks.push(value);
+          received += value.length;
+          if(!cancelled) setProgress(Math.min(99, Math.round(received/total*100)));
+        }
+        const text = await new Blob(chunks).text();
+        const json = JSON.parse(text);
+        if(!cancelled){ setProgress(100); setData(json); }
+      }catch(e){
+        if(!cancelled) setError(e.message);
+      }
+    }
+    load();
+    return ()=>{ cancelled = true; };
+  },[]);
+
+  const classified = useMemo(()=> data ? classifyEstoque(data) : null, [data]);
+
+  const mainLayout = useMemo(()=>{
+    if(!classified) return null;
+    return buildBlockLayout(classified.realRuas, classified.realPositions, 0);
+  }, [classified]);
+
+  const ficticiaLayout = useMemo(()=>{
+    if(!classified || !classified.ficticiaRuas.length) return null;
+    const originX = mainLayout ? mainLayout.totalWidth + BLOCK_GAP : 0;
+    return buildBlockLayout(classified.ficticiaRuas, classified.ficticiaPositions, originX);
+  }, [classified, mainLayout]);
+
+  const totalItens = useMemo(()=> data ? data.reduce((acc,p)=>acc+p.itens.length,0) : 0, [data]);
+  const totalAlertas = useMemo(()=> data ? data.filter(p=>p.alerta).length : 0, [data]);
+
+  // ocupação por rua: posições ocupadas vs capacidade teórica da grade
+  // (maxCol x maxNiv observados naquela rua). Ajuda a decidir onde alocar
+  // entrada nova sem precisar navegar o mapa 3D procurando vazio.
+  const ocupacaoPorRua = useMemo(()=>{
+    if(!mainLayout) return {};
+    const ocupadas = {};
+    mainLayout.positions.forEach(p=>{ ocupadas[p.rua] = (ocupadas[p.rua]||0) + 1; });
+    const out = {};
+    mainLayout.ruas.forEach(r=>{
+      const capacidade = (mainLayout.maxColByRua[r]||0) * (mainLayout.maxLevelByRua[r]||0);
+      const ocupado = ocupadas[r] || 0;
+      out[r] = { ocupado, capacidade, pct: capacidade>0 ? ocupado/capacidade : 0 };
+    });
+    return out;
+  }, [mainLayout]);
+
+  const ruasLotadas = useMemo(()=> Object.values(ocupacaoPorRua).filter(o=>o.pct>=0.85).length, [ocupacaoPorRua]);
+
+  const clientes = useMemo(()=>{
+    if(!data) return [];
+    const set = new Set();
+    data.forEach(p=>p.itens.forEach(it=>{ if(it[0]) set.add(it[0]); }));
+    return Array.from(set).sort();
+  }, [data]);
+
+  // valores reais do campo "Familia" da planilha (BRINDE, VESTUARIO, DISPLAY, PRODUTO, GRÁFICO...)
+  const familias = useMemo(()=>{
+    if(!data) return [];
+    const set = new Set();
+    data.forEach(p=>p.itens.forEach(it=>{ if(it[10]) set.add(it[10]); }));
+    return Array.from(set).sort();
+  }, [data]);
+
+  // lista de resultados quando o modo é "busca"
+  const searchResults = useMemo(()=>{
+    if(!data || mode.type!=="busca" || !mode.value) return [];
+    const q = mode.value.toUpperCase();
+    return data.filter(p =>
+      p.pos.toUpperCase().includes(q) ||
+      p.itens.some(it => (it[0]||"").toUpperCase().includes(q) || (it[1]||"").toUpperCase().includes(q) || (it[2]||"").toUpperCase().includes(q))
+    );
+  }, [data, mode]);
+  const searchResultsShown = useMemo(()=> searchResults.slice(0,40), [searchResults]);
+
+  const modeLabel = mode.type==="cliente" ? "Cliente: " + mode.value + " (destaque amarelo sólido)"
+    : mode.type==="familia" ? "Família: " + mode.value + " (destaque sólido)"
+    : mode.type==="busca" ? "Busca: \"" + mode.value + "\""
+    : mode.type==="vencido" ? "Mostrando apenas posições com item VENCIDO (vermelho sólido)"
+    : mode.type==="danificado" ? "Mostrando apenas posições com item DANIFICADO (vermelho sólido)"
+    : mode.type==="risco" ? "Vencidos + a vencer em até 15 dias (vermelho sólido)"
+    : mode.type==="vazio" ? "Destacando posições vazias (branco sólido)"
+    : null;
+
+  // avisa a cena Three.js sempre que o modo de visualização mudar
+  useEffect(()=>{
+    api.current.applyMode && api.current.applyMode(mode);
+  }, [mode]);
+
+  useEffect(()=>{
+    api.current.setSelectedByPos && api.current.setSelectedByPos(selected ? selected.pos : null);
+  }, [selected]);
+
+  useEffect(()=>{
+    api.current.onModeChange && api.current.onModeChange(viewMode);
+  }, [viewMode]);
+
+  const focusPosition = useCallback((pos)=>{
+    setSelected(pos);
+    api.current.focusCamera && api.current.focusCamera(pos);
+  }, []);
+  const jumpToRua = useCallback((rua)=>{
+    api.current.jumpToRua && api.current.jumpToRua(rua);
+  }, []);
+  const jumpToFicticio = useCallback(()=>{
+    api.current.jumpToFicticio && api.current.jumpToFicticio();
+  }, []);
+  const resetView = useCallback(()=>{
+    api.current.resetView && api.current.resetView();
+  }, []);
+
+  const toggleMode = useCallback((type)=>{
+    setSearchText("");
+    setMode(prev => prev.type===type ? { type:"none" } : { type });
+  }, []);
+  const onSearchChange = useCallback((val)=>{
+    setSearchText(val);
+    setMode(val.trim() ? { type:"busca", value: val.trim() } : { type:"none" });
+  }, []);
+  const onClienteChange = useCallback((val)=>{
+    setSearchText("");
+    setMode(val ? { type:"cliente", value: val } : { type:"none" });
+  }, []);
+  const onFamiliaChange = useCallback((val)=>{
+    setSearchText("");
+    setMode(val ? { type:"familia", value: val } : { type:"none" });
+  }, []);
+
+  /* =======================================================================
+     EFEITO PRINCIPAL: monta a cena Three.js (executa uma vez que os dados
+     e os layouts estão prontos)
+     ======================================================================= */
+  useEffect(()=>{
+    if(!data || !mainLayout) return;
+    const mount = mountRef.current;
+    const width = mount.clientWidth, height = mount.clientHeight;
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0xf2f1ec);
+    const totalWidthAll = mainLayout.totalWidth + (ficticiaLayout ? BLOCK_GAP + ficticiaLayout.totalWidth : 0);
+    const totalDepthAll = Math.max(mainLayout.totalDepth, ficticiaLayout ? ficticiaLayout.totalDepth : 0);
+    scene.fog = new THREE.Fog(0xf2f1ec, 55, 180);
+
+    const centerX = mainLayout.totalWidth/2 - mainLayout.corridorSpanX/2;
+    const centerZ = mainLayout.totalDepth/2;
+    const maxOrbitRadius = Math.max(totalWidthAll, totalDepthAll) * 1.3 + 30;
+    const initialColSort = mainLayout.ruas.map(r=>mainLayout.maxColByRua[r]||0).sort((a,b)=>a-b);
+    const typicalDepth = (initialColSort[Math.floor(initialColSort.length/2)] || 1) * COL_SPACING;
+    const initialRadius = Math.min(maxOrbitRadius, Math.max(mainLayout.totalWidth, typicalDepth)*0.55 + 14);
+
+    const camera = new THREE.PerspectiveCamera(55, width/height, 0.1, 600);
+    const renderer = new THREE.WebGLRenderer({ antialias:true, powerPreference:"high-performance" });
+    renderer.setSize(width, height);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio||1, 1.5));
+    mount.appendChild(renderer.domElement);
+
+    scene.add(new THREE.AmbientLight(0xffffff, 1.0));
+    const dirLight = new THREE.DirectionalLight(0xffffff, 0.9);
+    dirLight.position.set(centerX+25, 35, centerZ+18);
+    scene.add(dirLight);
+    scene.add(new THREE.HemisphereLight(0xffffff, 0xcfd6d6, 0.6));
+
+    const floor = new THREE.Mesh(
+      new THREE.PlaneGeometry(totalWidthAll+30, totalDepthAll+30),
+      new THREE.MeshStandardMaterial({ color:0xf7f6f2, roughness:0.9 })
+    );
+    floor.rotation.x = -Math.PI/2;
+    floor.position.set(centerX + (ficticiaLayout? (ficticiaLayout.totalWidth+BLOCK_GAP)/2 : 0), 0, centerZ);
+    scene.add(floor);
+
+    const postMat = new THREE.MeshStandardMaterial({ color:0x1a4fc4, roughness:0.35, metalness:0.55 });
+    const beamMat = new THREE.MeshStandardMaterial({ color:0xf07d1a, roughness:0.35, metalness:0.5 });
+    const ficticioPostMat = new THREE.MeshStandardMaterial({ color:0x6a4b8a, roughness:0.4, metalness:0.6 });
+    const ficticioBeamMat = new THREE.MeshStandardMaterial({ color:0x8a5a5a, roughness:0.4, metalness:0.5 });
+
+    const aisleHighlightMat = new THREE.MeshStandardMaterial({ color:0xc9be87, roughness:0.85, transparent:true, opacity:0.28 });
+
+    // texturas de rótulo reaproveitadas (mesma string = mesma textura)
+    const labelTextureCache = new Map();
+    function getLabelTexture(text, opts){
+      opts = opts || {};
+      const key = text + "|" + (opts.big?1:0) + "|" + (opts.color||"");
+      if(labelTextureCache.has(key)) return labelTextureCache.get(key);
+      const canvas = document.createElement("canvas");
+      canvas.width = opts.big ? 320 : 96;
+      canvas.height = opts.big ? 144 : 48;
+      const ctx = canvas.getContext("2d");
+      ctx.fillStyle = opts.color || "#f4efe6";
+      ctx.font = "bold " + (opts.big ? 96 : 30) + "px monospace";
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.fillText(text, canvas.width/2, canvas.height/2);
+      const tex = new THREE.CanvasTexture(canvas);
+      labelTextureCache.set(key, tex);
+      return tex;
+    }
+    function addLabelSprite(text, x, y, z, opts){
+      opts = opts || {};
+      const tex = getLabelTexture(text, opts);
+      const sprite = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, transparent:true }));
+      sprite.position.set(x,y,z);
+      sprite.scale.set(opts.big ? 3.6 : (opts.tiny ? 0.32 : 0.85), opts.big ? 1.62 : (opts.tiny ? 0.16 : 0.42), 1);
+      scene.add(sprite);
+      return sprite;
+    }
+
+    // texto "pintado no chão": um plano deitado (não vira de frente pra
+    // câmera como o sprite) — pra ler de cima, tipo pintura de piso
+    const floorLabelTextureCache = new Map();
+    function getFloorLabelTexture(text, color){
+      const key = text + "|" + color;
+      if(floorLabelTextureCache.has(key)) return floorLabelTextureCache.get(key);
+      const canvas = document.createElement("canvas");
+      canvas.width = 1024; canvas.height = 192;
+      const ctx = canvas.getContext("2d");
+      ctx.clearRect(0,0,canvas.width,canvas.height);
+      ctx.fillStyle = color || "#1c2b3a";
+      ctx.font = "bold 108px 'Inter', system-ui, sans-serif";
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.fillText(text, canvas.width/2, canvas.height/2);
+      const tex = new THREE.CanvasTexture(canvas);
+      floorLabelTextureCache.set(key, tex);
+      return tex;
+    }
+    function addFloorLabel(text, x, z, opts){
+      opts = opts || {};
+      const tex = getFloorLabelTexture(text, opts.color);
+      const mat = new THREE.MeshBasicMaterial({ map:tex, transparent:true, depthWrite:false });
+      const planeW = opts.width || 6;
+      const planeH = planeW * (192/1024);
+      const mesh = new THREE.Mesh(new THREE.PlaneGeometry(planeW, planeH), mat);
+      mesh.rotation.x = -Math.PI/2;
+      if(opts.rotationZ) mesh.rotation.z = opts.rotationZ;
+      mesh.position.set(x, opts.y!=null ? opts.y : 0.025, z);
+      scene.add(mesh);
+      return mesh;
+    }
+    // placa PEQUENA e VERTICAL, fixa na borda do palete voltada pro
+    // corredor — diferente de sprite (não vira pra câmera: tem orientação
+    // fixa, real, "presa" no espaço 3D) e diferente do texto de chão
+    // (fica em pé, então dá pra ler andando pelo corredor e olhando de
+    // lado — deitado ficava de perfil/invisível nesse ângulo).
+    // depthTest desligado pra nunca ser cortada por viga/poste próximos.
+    function addPalletDecal(text, x, y, z, faceDir, width){
+      const tex = getFloorLabelTexture(text, "#000000");
+      const mat = new THREE.MeshBasicMaterial({ map:tex, transparent:true, depthWrite:false, depthTest:false });
+      const w = width || 0.42;
+      const h = w * (192/1024);
+      const mesh = new THREE.Mesh(new THREE.PlaneGeometry(w, h), mat);
+      mesh.rotation.y = faceDir * Math.PI/2; // normal da placa voltada pro corredor
+      mesh.renderOrder = 999;
+      mesh.position.set(x, y, z);
+      mesh.visible = false;
+      scene.add(mesh);
+      return mesh;
+    }
+
+    // ---------------------------------------------------------------------
+    // Constrói estrutura física (postes, vigas, rótulos) de um bloco de ruas
+    // ---------------------------------------------------------------------
+    function buildRackStructure(layout, opts){
+      opts = opts || {};
+      const pMat = opts.ficticio ? ficticioPostMat : postMat;
+      const bMat = opts.ficticio ? ficticioBeamMat : beamMat;
+
+      let postCount = 0, beamCount = 0;
+      layout.ruas.forEach(rua=>{
+        postCount += ((layout.maxColByRua[rua]||0)+1) * 2;
+        beamCount += ((layout.maxLevelByRua[rua]||0)+1) * 2;
+      });
+      const dummy = new THREE.Object3D();
+      const postGeo = new THREE.BoxGeometry(POST_SIZE, 1, POST_SIZE);
+      const posts = new THREE.InstancedMesh(postGeo, pMat, Math.max(1, postCount));
+      const beamGeo = new THREE.BoxGeometry(BEAM_THICK, BEAM_THICK, 1);
+      const beams = new THREE.InstancedMesh(beamGeo, bMat, Math.max(1, beamCount));
+      let pi = 0, bi = 0;
+
+      layout.corridors.forEach((c,ci)=>{
+        const cx = layout.originX + ci*layout.corridorSpanX;
+        const highlight = new THREE.Mesh(new THREE.PlaneGeometry(AISLE_WIDTH*0.94, layout.totalDepth), aisleHighlightMat);
+        highlight.rotation.x = -Math.PI/2;
+        highlight.position.set(cx, 0.01, layout.totalDepth/2);
+        scene.add(highlight);
+      });
+
+      layout.ruas.forEach(rua=>{
+        const x = layout.ruaX[rua];
+        if(x === undefined) return;
+        const maxCol = layout.maxColByRua[rua] || 0;
+        const maxNiv = layout.maxLevelByRua[rua] || 0;
+        const rackTopY = maxNiv*LEVEL_HEIGHT + BASE_LEVEL_Y + 0.3;
+        const rackDepthZ = maxCol*COL_SPACING;
+
+        for(let k=0; k<=maxCol; k++){
+          const z = k*COL_SPACING;
+          [-RACK_DEPTH/2, RACK_DEPTH/2].forEach(offset=>{
+            dummy.position.set(x+offset, rackTopY/2, z);
+            dummy.scale.set(1, rackTopY, 1);
+            dummy.updateMatrix();
+            posts.setMatrixAt(pi++, dummy.matrix);
+          });
+        }
+        for(let k=0; k<=maxNiv; k++){
+          const y = BASE_LEVEL_Y + k*LEVEL_HEIGHT;
+          [-RACK_DEPTH/2, RACK_DEPTH/2].forEach(offset=>{
+            dummy.position.set(x+offset, y, rackDepthZ/2);
+            dummy.scale.set(1, 1, rackDepthZ+0.3);
+            dummy.updateMatrix();
+            beams.setMatrixAt(bi++, dummy.matrix);
+          });
+        }
+
+        // plaquinha da rua, sempre no início da sequência (antes da coluna 1)
+        addLabelSprite(rua, x, rackTopY+0.7, -1.4, { big:true, color: opts.ficticio ? "#7a2fb0" : "#1c2b3a" });
+
+        // plaquinhas numeradas ao longo da coluna, no início de cada posição
+        if(!opts.ficticio){
+          for(let col=1; col<=maxCol; col+=COLUMN_TAG_STEP){
+            const zStart = (col-1)*COL_SPACING;
+            addLabelSprite(String(col).padStart(2,"0"), x, 0.28, zStart+0.05, { color:"#8a6512" });
+          }
+        }
+      });
+
+      posts.instanceMatrix.needsUpdate = true;
+      beams.instanceMatrix.needsUpdate = true;
+      scene.add(posts);
+      scene.add(beams);
+    }
+
+    buildRackStructure(mainLayout, { ficticio:false });
+    if(ficticiaLayout){
+      buildRackStructure(ficticiaLayout, { ficticio:true });
+      // divisória/placa entre o galpão e o bloco fictício
+      addLabelSprite("\u26A0 BLOCO FICTÍCIO / IRREGULAR", ficticiaLayout.originX - BLOCK_GAP/2, 4.2, ficticiaLayout.totalDepth/2, { big:true, color:"#d9a4ff" });
+    }
+
+    // ---------------------------------------------------------------------
+    // Faixa de piso por ZONA (aproximação da planta oficial — ver nota em
+    // ZONA_CORES/zonaPorIndiceRua). Só no galpão principal (ruas reais).
+    // ---------------------------------------------------------------------
+    (function addZonaFloorTint(layout){
+      const zonaMat = {};
+      Object.keys(ZONA_CORES).forEach(k=>{
+        zonaMat[k] = new THREE.MeshBasicMaterial({ color: ZONA_CORES[k], transparent:true, opacity:0.28, depthWrite:false });
+      });
+      const grupoX = {}; // zona -> lista de X das ruas daquela zona (pra centralizar o texto)
+      layout.ruas.forEach((rua, idx)=>{
+        const x = layout.ruaX[rua];
+        if(x === undefined) return;
+        const zona = zonaPorIndiceRua(idx);
+        const maxCol = layout.maxColByRua[rua] || 0;
+        const depth = maxCol * COL_SPACING;
+        if(depth <= 0) return;
+        const plane = new THREE.Mesh(new THREE.PlaneGeometry(RACK_DEPTH*1.3, depth), zonaMat[zona]);
+        plane.rotation.x = -Math.PI/2;
+        plane.position.set(x, 0.015, depth/2);
+        scene.add(plane);
+        (grupoX[zona] = grupoX[zona]||[]).push(x);
+      });
+      const ZONA_NOME = { alimentos:"ALIMENTOS", cosmeticos:"COSMÉTICOS", quarentena:"QUARENTENA",
+        naoConformes:"NÃO CONFORMES", semInteresse:"PRODUTOS SEM INTERESSE À SAÚDE" };
+      const ZONA_COR_CSS = {};
+      Object.keys(ZONA_CORES).forEach(k=>{ ZONA_COR_CSS[k] = "#"+ZONA_CORES[k].toString(16).padStart(6,"0"); });
+      Object.keys(grupoX).forEach(zona=>{
+        const xs = grupoX[zona];
+        const xMid = xs.reduce((a,b)=>a+b,0)/xs.length;
+        const largura = Math.min(20, Math.max(4, xs.length * 1.1));
+        addFloorLabel(ZONA_NOME[zona], xMid, 3.2, { color: ZONA_COR_CSS[zona], width: largura });
+      });
+    })(mainLayout);
+
+    // ---------------------------------------------------------------------
+    // Corredores TRANSVERSAIS ("túneis") cruzando as ruas periodicamente —
+    // aproximação visual da faixa de circulação/segurança que a planta
+    // mostra cortando as fileiras. Não removo nem realinho nenhuma posição
+    // real pra isso (a planilha do WMS é a fonte da verdade da coluna real);
+    // é só uma referência visual sobreposta, sem impacto nos dados.
+    // ---------------------------------------------------------------------
+    (function addTuneisTransversais(layout){
+      const totalW = layout.totalWidth;
+      const maxDepthCols = Math.max(1, Math.round(layout.totalDepth / COL_SPACING));
+      const intervalCols = 18;
+      const tunnelMat = new THREE.MeshBasicMaterial({ color:0xffffff, transparent:true, opacity:0.45, depthWrite:false });
+      for(let col = intervalCols; col < maxDepthCols; col += intervalCols){
+        const z = col * COL_SPACING;
+        const plane = new THREE.Mesh(new THREE.PlaneGeometry(totalW, COL_SPACING*1.3), tunnelMat);
+        plane.rotation.x = -Math.PI/2;
+        plane.position.set(totalW/2, 0.02, z);
+        scene.add(plane);
+        addFloorLabel("\u2194 CORREDOR TRANSVERSAL", totalW/2, z, { color:"#33475a", width: Math.min(totalW*0.6, 14) });
+      }
+    })(mainLayout);
+
+    // ---------------------------------------------------------------------
+    // Área operacional de FRENTE do galpão — lida diretamente da planta
+    // oficial em alta resolução (Processo PMB 059627/2026, Planta Pavimento
+    // Térreo). Ordem real das zonas, do lado das ruas de Alimentos/Cosméticos
+    // (produto "relacionado à saúde") até o lado das ruas de Produtos Sem
+    // Interesse à Saúde / Alto Valor (material "promocional"), acompanhando
+    // a mesma ordem usada em zonaPorIndiceRua. O POSICIONAMENTO X de cada
+    // zona/doca é proporcional (não há coordenada exata do DWG), mas os
+    // NOMES, a ORDEM e a QUANTIDADE de docas (12) são os reais da planta.
+    // ---------------------------------------------------------------------
+    (function addFrenteOperacional(layout){
+      const totalW = layout.totalWidth;
+      const depth = 7.5;
+      const zonas = [
+        { nome:"SEPARAÇÃO/CONFERÊNCIA (SAÚDE)",        cor:0x5a6b7a, frac:0.07 },
+        { nome:"EXPEDIÇÃO (SAÚDE)",                     cor:0x8a4fb0, frac:0.07 },
+        { nome:"RECEBIMENTO (SAÚDE)",                   cor:0x2e6f77, frac:0.07 },
+        { nome:"RECEBIMENTO (PROMOCIONAL)",             cor:0x2e6f77, frac:0.09 },
+        { nome:"ÁREA DE ACESSO / CONTROLE",             cor:0x6b6f74, frac:0.14 },
+        { nome:"EXPEDIÇÃO (PROMOCIONAL)",               cor:0x8a4fb0, frac:0.28 },
+        { nome:"SEPARAÇÃO/CONFERÊNCIA (PROMOCIONAL)",   cor:0x5a6b7a, frac:0.14 },
+        { nome:"BLOCADO",                               cor:0xd4b106, frac:0.14 }
+      ];
+      let xCursor = 0;
+      zonas.forEach(zn=>{
+        const w = totalW * zn.frac;
+        const mat = new THREE.MeshBasicMaterial({ color:zn.cor, transparent:true, opacity:0.4, depthWrite:false });
+        const plane = new THREE.Mesh(new THREE.PlaneGeometry(Math.max(0.5,w-0.4), depth-0.6), mat);
+        plane.rotation.x = -Math.PI/2;
+        plane.position.set(xCursor + w/2, 0.02, -depth/2);
+        scene.add(plane);
+        addFloorLabel(zn.nome, xCursor + w/2, -depth/2, { color:"#eef2f0", width: Math.min(w-1, 9) });
+        xCursor += w;
+      });
+      // 12 docas reais (Doca 01 a Doca 12), conforme a planta — posição X
+      // proporcional ao longo da mesma fachada das zonas acima.
+      const numDocas = 12;
+      for(let i=0;i<numDocas;i++){
+        const x = (totalW/numDocas)*(i+0.5);
+        addFloorLabel("DOCA " + String(i+1).padStart(2,"0"), x, -depth-0.9, { color:"#c9a24a", width:2.2 });
+      }
+    })(mainLayout);
+
+    // ---------------------------------------------------------------------
+    // Camada ÚNICA por posição OCUPADA: 1 palete + N caixas (uma pilha).
+    // Posição sem material = simplesmente não existe aqui (nada é desenhado).
+    // Palete e caixas compartilham o mesmo índice de entrada, então qualquer
+    // filtro que oculte a posição oculta as DUAS coisas juntas.
+    // ---------------------------------------------------------------------
+    const hojeRef = new Date(); hojeRef.setHours(0,0,0,0);
+    function buildOccupiedLayer(layout){
+      const occupied = layout.positions.filter(p => layout.ruaX[p.rua] !== undefined);
+
+      const palletSizeX = RACK_DEPTH*0.8, palletSizeZ = COL_SPACING*0.86;
+      const palletGeo = new THREE.BoxGeometry(1,1,1);
+      const palletMat = new THREE.MeshStandardMaterial({ roughness:0.92, metalness:0.0 });
+      const palletMesh = new THREE.InstancedMesh(palletGeo, palletMat, Math.max(1, occupied.length));
+      palletMesh.frustumCulled = false;
+
+      const entries = occupied.map((p,i)=>{
+        const x = layout.ruaX[p.rua];
+        const z = (p.col - 0.5) * COL_SPACING;
+        const palletY = BASE_LEVEL_Y + (p.niv-1)*LEVEL_HEIGHT + PALLET_HEIGHT/2 + 0.02;
+        const baseY = BASE_LEVEL_Y + (p.niv-1)*LEVEL_HEIGHT + PALLET_HEIGHT + 0.03;
+        const itemCount = p.itens.length;
+        const risco = riscoValidadePosicao(p.itens, hojeRef);
+        const danificado = p.itens.some(it=>isTruthy(it[8]));
+        const tier = tierForItemCount(itemCount);
+        return { data:p, index:i, x, z, palletY, baseY, itemCount, risco, danificado, tier, instanceIndices:[] };
+      });
+
+      const dummy = new THREE.Object3D();
+      function writePalletMatrix(e, scaleMul){
+        dummy.position.set(e.x, e.palletY, e.z);
+        dummy.scale.set(palletSizeX*scaleMul, PALLET_HEIGHT*scaleMul, palletSizeZ*scaleMul);
+        dummy.updateMatrix();
+        palletMesh.setMatrixAt(e.index, dummy.matrix);
+      }
+      entries.forEach(e=>{ writePalletMatrix(e,1); palletMesh.setColorAt(e.index, COLOR_PALLET); });
+      palletMesh.instanceMatrix.needsUpdate = true;
+      if(palletMesh.instanceColor) palletMesh.instanceColor.needsUpdate = true;
+      scene.add(palletMesh);
+
+      const instances = [];
+      entries.forEach(e=>{
+        tierTemplate(e.tier).forEach(s=>{
+          const idx = instances.length;
+          instances.push({ entry:e, dx:s.dx, dz:s.dz, y0:s.y0, sx:s.sx, sy:s.sy, sz:s.sz });
+          e.instanceIndices.push(idx);
+        });
+      });
+
+      const boxGeo = new THREE.BoxGeometry(1,1,1);
+      const boxMat = new THREE.MeshStandardMaterial({ roughness:0.85, metalness:0.02 });
+      const mesh = new THREE.InstancedMesh(boxGeo, boxMat, Math.max(1, instances.length));
+      mesh.frustumCulled = false;
+
+      function writeInstance(i, scaleMul){
+        const inst = instances[i];
+        const e = inst.entry;
+        dummy.position.set(e.x+inst.dx, e.baseY+inst.y0, e.z+inst.dz);
+        dummy.scale.set(inst.sx*scaleMul, inst.sy*scaleMul, inst.sz*scaleMul);
+        dummy.updateMatrix();
+        mesh.setMatrixAt(i, dummy.matrix);
+      }
+      instances.forEach((inst,i)=>{
+        writeInstance(i, 1);
+        mesh.setColorAt(i, COLOR_PAPELAO[i % COLOR_PAPELAO.length]);
+      });
+      mesh.instanceMatrix.needsUpdate = true;
+      if(mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
+      scene.add(mesh);
+
+      // placa de identificação VERTICAL, fixa na borda do palete voltada pro
+      // corredor (não flutua, não vira pra câmera — orientação fixa de verdade)
+      const posLabels = [];
+      entries.forEach(e=>{
+        const faceDir = layout.ruaFaceDir[e.data.rua] || 1;
+        const decalW = 0.4;
+        const labelX = e.x + faceDir * (palletSizeX/2 + 0.015);
+        const labelY = e.palletY;
+        const spr = addPalletDecal(String(e.data.pos), labelX, labelY, e.z, faceDir, decalW);
+        posLabels.push(spr);
+      });
+
+      const posIndex = new Map();
+      entries.forEach(e=>posIndex.set(e.data.pos, e));
+      return { mesh, palletMesh, entries, instances, writeInstance, writePalletMatrix, posIndex, posLabels };
+    }
+
+    // ---------------------------------------------------------------------
+    // Camada só pro filtro "Vazias": marcador branco na grade teórica menos
+    // as posições ocupadas. Fica com escala 0 (invisível) até o filtro ligar.
+    // ---------------------------------------------------------------------
+    function buildEmptyHighlightLayer(layout){
+      const slots = computeEmptySlots(layout).filter(s=>layout.ruaX[s.rua]!==undefined);
+      const geo = new THREE.BoxGeometry(1,1,1);
+      const mat = new THREE.MeshStandardMaterial({ roughness:0.9, metalness:0.0 });
+      const mesh = new THREE.InstancedMesh(geo, mat, Math.max(1, slots.length));
+      mesh.frustumCulled = false;
+      const sizeX = RACK_DEPTH*0.92, sizeZ = COL_SPACING*0.92, sizeY = LEVEL_HEIGHT*0.85;
+      const entries = slots.map((s,i)=>{
+        const x = layout.ruaX[s.rua];
+        const z = (s.col-0.5)*COL_SPACING;
+        const y = BASE_LEVEL_Y + (s.niv-1)*LEVEL_HEIGHT + sizeY/2 + 0.05;
+        return { index:i, x, y, z };
+      });
+      const dummy = new THREE.Object3D();
+      function writeMatrix(e, scaleMul){
+        dummy.position.set(e.x, e.y, e.z);
+        dummy.scale.set(sizeX*scaleMul, sizeY*scaleMul, sizeZ*scaleMul);
+        dummy.updateMatrix();
+        mesh.setMatrixAt(e.index, dummy.matrix);
+      }
+      entries.forEach(e=>{ writeMatrix(e,0); mesh.setColorAt(e.index, COLOR_VAZIO); });
+      mesh.instanceMatrix.needsUpdate = true;
+      if(mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
+      scene.add(mesh);
+
+      // placa de identificação VERTICAL de cada vazia — são MILHARES (cada
+      // uma com textura própria), então NÃO cria tudo de cara: isso pesava
+      // bastante no carregamento inicial pra algo que só aparece quando o
+      // filtro "Vazias" é ligado. Fica adiado até a primeira vez que alguém
+      // realmente ativa o filtro (ver ensureLabels/api.current.applyMode).
+      const posLabels = [];
+      let labelsBuilt = false;
+      function ensureLabels(){
+        if(labelsBuilt) return posLabels;
+        labelsBuilt = true;
+        slots.forEach((s,i)=>{
+          const faceDir = layout.ruaFaceDir[s.rua] || 1;
+          const x = layout.ruaX[s.rua];
+          const z = (s.col-0.5)*COL_SPACING;
+          const midY = entries[i].y;
+          const decalW = 0.4;
+          const labelX = x + faceDir * (sizeX/2 + 0.015);
+          const spr = addPalletDecal(String(s.pos), labelX, midY, z, faceDir, decalW);
+          spr.userData.emptyLabel = true;
+          posLabels.push(spr);
+        });
+        return posLabels;
+      }
+
+      return { mesh, entries, writeMatrix, posLabels, ensureLabels };
+    }
+
+    const mainOccupied = buildOccupiedLayer(mainLayout);
+    const ficticiaOccupied = ficticiaLayout ? buildOccupiedLayer(ficticiaLayout) : null;
+    const allBoxLayers = ficticiaOccupied ? [mainOccupied, ficticiaOccupied] : [mainOccupied];
+    const allPosLabels = allBoxLayers.flatMap(l=>l.posLabels);
+    const combinedPosIndex = new Map();
+    allBoxLayers.forEach(layer => layer.posIndex.forEach((v,k)=>combinedPosIndex.set(k, { layer, entry:v })));
+
+    const emptyHighlight = buildEmptyHighlightLayer(mainLayout);
+    allPosLabels.push(...emptyHighlight.posLabels);
+
+    // severidade combinada de uma posição: prioriza vencido de verdade;
+    // se estiver danificada e também perto de vencer, ainda conta como
+    // "problema" pro contorno pulsante passivo (sem filtro ativo).
+    function severityOf(entry){
+      if(entry.risco === "vencido") return "vencido";
+      if(entry.danificado) return entry.risco || "vencido";
+      return entry.risco || null;
+    }
+
+    // contorno pulsante para posições com risco de validade (vencido/crítico/atenção) ou danificado
+    // — é passivo (aparece mesmo sem filtro ativo, pra chamar atenção de longe)
+    const RISCO_COR_HEX = { vencido:0xff5544, critico:0xff8c1a, atencao:0xf0c419 };
+    const alertMeshes = [];
+    allBoxLayers.forEach(layer=>{
+      layer.entries.forEach(e=>{
+        if(!e.risco && !e.danificado) return;
+        const corHex = RISCO_COR_HEX[e.risco] || 0xff5544;
+        const stackH = tierStackHeight(e.tier);
+        const g = new THREE.BoxGeometry(RACK_DEPTH*0.85, stackH*1.15, COL_SPACING*0.85);
+        const m = new THREE.MeshBasicMaterial({ color:corHex, transparent:true, opacity:0.5, wireframe:true });
+        const mesh = new THREE.Mesh(g, m);
+        mesh.position.set(e.x, e.baseY + stackH/2, e.z);
+        mesh.userData.risco = e.risco || "vencido";
+        scene.add(mesh);
+        alertMeshes.push(mesh);
+      });
+    });
+
+    /* ---------------------------------------------------------------------
+       Estado de interação (hover / seleção / modo de visualização)
+       --------------------------------------------------------------------- */
+    let hoveredEntry = null, selectedEntry = null;
+    let currentModeType = "none", currentModeValue = null;
+
+    function entryMatchesMode(entry){
+      if(currentModeType === "none" || currentModeType === "busca") return true;
+      if(currentModeType === "vazio") return false; // posições ocupadas somem inteiras (palete+caixa) nesse filtro
+      const itens = entry.data.itens;
+      if(currentModeType === "vencido")     return entry.risco === "vencido";
+      if(currentModeType === "danificado")  return itens.some(it => isTruthy(it[8]));
+      if(currentModeType === "risco")       return !!entry.risco;
+      if(currentModeType === "cliente")     return itens.some(it => String(it[0]||"").trim() === String(currentModeValue||"").trim());
+      if(currentModeType === "familia")     return itens.some(it => String(it[10]||"").trim() === String(currentModeValue||"").trim());
+      return true;
+    }
+    const FILTER_MODES = ["vencido","danificado","risco","cliente","familia","vazio"];
+    // cor SÓLIDA (sem opacidade/mistura) de destaque do filtro ativo — null
+    // significa "usar a cor padrão de papelão" (sem filtro).
+    function entryHighlightColor(entry){
+      if(currentModeType === "vencido" || currentModeType === "danificado" || currentModeType === "risco") return COLOR_VENCIDO_DANIFICADO;
+      if(currentModeType === "cliente") return COLOR_CLIENTE_DESTAQUE;
+      if(currentModeType === "familia") return new THREE.Color(corFamilia(currentModeValue));
+      return null;
+    }
+    function refreshEntryVisual(layer, entry){
+      const isFiltering = FILTER_MODES.includes(currentModeType);
+      const matches = entryMatchesMode(entry);
+      const visible = !isFiltering || matches;
+      const scaleMul = !visible ? 0 : (entry===hoveredEntry || entry===selectedEntry ? 1.14 : 1);
+      // o palete só existe (visualmente) enquanto a posição existe/combina com
+      // o filtro — sem material ali, ou filtrada pra fora, some junto com a caixa
+      layer.writePalletMatrix(entry, scaleMul);
+      layer.palletMesh.setColorAt(entry.index, COLOR_PALLET);
+      const highlightColor = entryHighlightColor(entry);
+      entry.instanceIndices.forEach(i=>{
+        layer.writeInstance(i, scaleMul);
+        let color = highlightColor ? highlightColor.clone() : COLOR_PAPELAO[i % COLOR_PAPELAO.length].clone();
+        if(entry===selectedEntry) color = color.lerp(COLOR_SELECT, 0.45);
+        else if(entry===hoveredEntry) color = color.lerp(COLOR_HOVER, 0.4);
+        layer.mesh.setColorAt(i, color);
+      });
+    }
+    function refreshAllVisuals(){
+      allBoxLayers.forEach(layer=>{
+        layer.entries.forEach(e=>refreshEntryVisual(layer, e));
+        layer.mesh.instanceMatrix.needsUpdate = true;
+        if(layer.mesh.instanceColor) layer.mesh.instanceColor.needsUpdate = true;
+        layer.mesh.material.needsUpdate = true;
+        layer.palletMesh.instanceMatrix.needsUpdate = true;
+        if(layer.palletMesh.instanceColor) layer.palletMesh.instanceColor.needsUpdate = true;
+      });
+    }
+    refreshAllVisuals();
+
+    // camada extra só do filtro "Vazias": mostra marcador branco sólido nas
+    // posições da grade que realmente não têm nenhum registro de estoque.
+    function refreshEmptyHighlight(){
+      const vazioAtivo = currentModeType === "vazio";
+      emptyHighlight.entries.forEach(e=> emptyHighlight.writeMatrix(e, vazioAtivo ? 1 : 0));
+      emptyHighlight.mesh.instanceMatrix.needsUpdate = true;
+    }
+    refreshEmptyHighlight();
+
+    // destaque de busca livre (não oculta, só realça e escurece o resto)
+    function applyBuscaHighlight(matchSet){
+      allBoxLayers.forEach(layer=>{
+        layer.entries.forEach(e=>{
+          const isMatch = matchSet && matchSet.has(e.data.pos);
+          e.instanceIndices.forEach(i=>{
+            let color = COLOR_PAPELAO[i % COLOR_PAPELAO.length].clone();
+            if(matchSet){
+              color = isMatch ? color.lerp(COLOR_HOVER, 0.5) : color.lerp(new THREE.Color(0x1a1d20), 0.6);
+            }
+            if(e===selectedEntry) color = color.lerp(COLOR_SELECT, 0.45);
+            layer.mesh.setColorAt(i, color);
+          });
+        });
+        layer.mesh.instanceColor && (layer.mesh.instanceColor.needsUpdate = true);
+      });
+    }
+
+    api.current.applyMode = (m)=>{
+      currentModeType = m.type;
+      currentModeValue = m.value || null;
+      if(m.type === "vazio"){
+        const novasLabels = emptyHighlight.ensureLabels();
+        // se acabaram de ser criadas agora, entra pro array geral de culling
+        novasLabels.forEach(l=>{ if(!allPosLabels.includes(l)) allPosLabels.push(l); });
+      }
+      if(m.type === "busca"){
+        refreshAllVisuals();
+        const q = m.value.toUpperCase();
+        const matchSet = new Set();
+        allBoxLayers.forEach(layer=>layer.entries.forEach(e=>{
+          const p = e.data;
+          const hit = p.pos.toUpperCase().includes(q) ||
+            p.itens.some(it => (it[0]||"").toUpperCase().includes(q) || (it[1]||"").toUpperCase().includes(q) || (it[2]||"").toUpperCase().includes(q));
+          if(hit) matchSet.add(p.pos);
+        }));
+        applyBuscaHighlight(matchSet);
+      } else {
+        refreshAllVisuals();
+      }
+      refreshEmptyHighlight();
+    };
+
+    api.current.setSelectedByPos = (pos)=>{
+      const found = pos ? combinedPosIndex.get(pos) : null;
+      const newEntry = found ? found.entry : null;
+      if(newEntry === selectedEntry) return;
+      selectedEntry = newEntry;
+      refreshAllVisuals();
+      if(currentModeType === "busca") api.current.applyMode({ type:"busca", value: currentModeValue || "" });
+    };
+
+    /* ---------------------------------------------------------------------
+       Câmera: órbita e caminhada (andar)
+       --------------------------------------------------------------------- */
+    const initialX = mainLayout.ruaX[mainLayout.ruas[0]] !== undefined ? mainLayout.ruaX[mainLayout.ruas[0]] : centerX;
+    const orbitTarget = new THREE.Vector3(initialX, 1.7, Math.min(typicalDepth*0.35, mainLayout.totalDepth/2));
+    const spherical = new THREE.Spherical(initialRadius, Math.PI/3.1, Math.PI*0.22);
+    let radiusTarget = spherical.radius;      // zoom suavizado (lerp por frame)
+    let thetaVelocity = 0, phiVelocity = 0;   // "momentum" do arraste — continua girando suave ao soltar
+
+    const walk = { x: centerX, z: mainLayout.totalDepth/2, yaw: 0, pitch: 0, y: 1.6 };
+    const keys = {};
+    api.current.setKey = (k,v)=>{ keys[k]=v; };
+
+    const clamp = (v,min,max)=>Math.max(min, Math.min(max, v));
+    const clampOrbitTarget = ()=>{
+      orbitTarget.x = clamp(orbitTarget.x, -40, totalWidthAll+40);
+      orbitTarget.z = clamp(orbitTarget.z, -40, totalDepthAll+40);
+    };
+    const clampWalk = ()=>{
+      walk.x = clamp(walk.x, -30, totalWidthAll+30);
+      walk.z = clamp(walk.z, -10, totalDepthAll+10);
+    };
+
+    // ponteiros (arraste / pinça)
+    const pointers = new Map();
+    let dragging = false, lastX=0, lastY=0, dragDistance=0, dragButton=0;
+    let pinchStartDist=null, pinchStartMid=null, pinchStartTarget=null;
+    const dist2 = (a,b)=>Math.hypot(a.x-b.x, a.y-b.y);
+    const mid2 = (a,b)=>({ x:(a.x+b.x)/2, y:(a.y+b.y)/2 });
+
+    const onPointerDown = (e)=>{
+      pointers.set(e.pointerId, { x:e.clientX, y:e.clientY });
+      if(pointers.size===1){ dragging=true; lastX=e.clientX; lastY=e.clientY; dragDistance=0; thetaVelocity=0; phiVelocity=0; dragButton=e.button; }
+      else if(pointers.size===2){
+        dragging=false;
+        const pts = Array.from(pointers.values());
+        pinchStartDist = dist2(pts[0], pts[1]);
+        pinchStartMid = mid2(pts[0], pts[1]);
+        pinchStartTarget = orbitTarget.clone();
+      }
+    };
+    const onPointerUp = (e)=>{
+      pointers.delete(e.pointerId);
+      if(pointers.size<2){ pinchStartDist=null; pinchStartMid=null; }
+      if(pointers.size===0) dragging=false;
+      else if(pointers.size===1){ const p=Array.from(pointers.values())[0]; dragging=true; lastX=p.x; lastY=p.y; }
+    };
+    const onPointerMove = (e)=>{
+      if(pointers.has(e.pointerId)) pointers.set(e.pointerId, { x:e.clientX, y:e.clientY });
+      if(pointers.size>=2 && viewModeRef.current==="orbit"){
+        const pts = Array.from(pointers.values());
+        const d = dist2(pts[0], pts[1]);
+        const mid = mid2(pts[0], pts[1]);
+        if(pinchStartDist!=null){ radiusTarget = clamp(radiusTarget + (pinchStartDist-d)*0.03, 4, maxOrbitRadius); pinchStartDist = d; }
+        if(pinchStartMid && pinchStartTarget){
+          const dx = mid.x - pinchStartMid.x, dy = mid.y - pinchStartMid.y;
+          const theta = spherical.theta;
+          const scale = spherical.radius*0.0028;
+          orbitTarget.x = pinchStartTarget.x - Math.cos(theta)*dx*scale + (-Math.sin(theta))*dy*scale;
+          orbitTarget.z = pinchStartTarget.z - (-Math.sin(theta))*dx*scale + (-Math.cos(theta))*dy*scale;
+          clampOrbitTarget();
+        }
+        return;
+      }
+      const dx = e.clientX-lastX, dy = e.clientY-lastY;
+      if(dragging){
+        dragDistance += Math.abs(dx)+Math.abs(dy);
+        if(viewModeRef.current==="orbit" && (e.ctrlKey || dragButton===2)){
+          // Ctrl + arraste do mouse = "andar" pelo corredor sem precisar
+          // trocar de modo — desloca o alvo da câmera (pan) na direção que
+          // você arrasta, em vez de girar.
+          thetaVelocity = 0; phiVelocity = 0;
+          const theta = spherical.theta;
+          const scale = spherical.radius*0.0032;
+          orbitTarget.x -= (Math.cos(theta)*dx - Math.sin(theta)*dy) * scale;
+          orbitTarget.z -= (-Math.sin(theta)*dx - Math.cos(theta)*dy) * scale;
+          clampOrbitTarget();
+        } else if(viewModeRef.current==="orbit"){
+          const dTheta = -dx*0.008, dPhi = dy*0.008;
+          spherical.theta += dTheta;
+          spherical.phi = clamp(spherical.phi + dPhi, 0.15, Math.PI/2.05);
+          // guarda a velocidade do último movimento pra "soltar e continuar girando" suave
+          thetaVelocity = dTheta*0.6;
+          phiVelocity = dPhi*0.6;
+        } else {
+          walk.yaw -= dx*0.0045;
+          walk.pitch = clamp(walk.pitch - dy*0.0045, -1.1, 1.1);
+        }
+      }
+      lastX = e.clientX; lastY = e.clientY;
+    };
+    const onWheel = (e)=>{
+      e.preventDefault();
+      if(viewModeRef.current==="orbit") radiusTarget = clamp(radiusTarget + e.deltaY*0.02, 4, maxOrbitRadius);
+    };
+    const onKeyDown = (e)=>{ keys[e.code]=true; };
+    const onKeyUp   = (e)=>{ keys[e.code]=false; };
+
+    const onContextMenu = (e)=>{ e.preventDefault(); };
+
+    renderer.domElement.addEventListener("pointerdown", onPointerDown);
+    window.addEventListener("pointerup", onPointerUp);
+    window.addEventListener("pointercancel", onPointerUp);
+    window.addEventListener("pointermove", onPointerMove);
+    renderer.domElement.addEventListener("wheel", onWheel, { passive:false });
+    renderer.domElement.addEventListener("contextmenu", onContextMenu);
+    window.addEventListener("keydown", onKeyDown);
+    window.addEventListener("keyup", onKeyUp);
+    renderer.domElement.style.touchAction = "none";
+
+    const raycaster = new THREE.Raycaster();
+    const pointerNdc = new THREE.Vector2();
+    const updatePointerNdc = (e)=>{
+      const rect = renderer.domElement.getBoundingClientRect();
+      pointerNdc.x = (e.clientX-rect.left)/rect.width*2-1;
+      pointerNdc.y = -((e.clientY-rect.top)/rect.height)*2+1;
+    };
+    renderer.domElement.addEventListener("mousemove", updatePointerNdc);
+
+    const onClick = ()=>{
+      if(dragDistance>6) return;
+      raycaster.setFromCamera(pointerNdc, camera);
+      const hits = raycaster.intersectObjects(allBoxLayers.map(l=>l.mesh));
+      if(hits.length>0){
+        const hitMesh = hits[0].object;
+        const layer = allBoxLayers.find(l=>l.mesh===hitMesh);
+        const entry = layer.instances[hits[0].instanceId].entry;
+        if(!entryMatchesMode(entry) && FILTER_MODES.includes(currentModeType)) return;
+        setSelected(prev => (prev && prev.pos===entry.data.pos) ? null : entry.data);
+      }
+    };
+    renderer.domElement.addEventListener("click", onClick);
+
+    // depois de qualquer "pulo" programático de câmera, sincroniza o alvo de
+    // zoom suavizado e zera o momentum de arraste (senão ele "herdaria"
+    // velocidade de um arraste anterior e continuaria girando sozinho)
+    const syncCameraTargets = ()=>{ radiusTarget = spherical.radius; thetaVelocity = 0; phiVelocity = 0; };
+
+    // foca a câmera numa posição específica (clique na lista de busca ou no bloco)
+    api.current.focusCamera = (pos)=>{
+      const layer = mainLayout.ruaX[pos.rua]!==undefined ? mainLayout : ficticiaLayout;
+      const x = layer.ruaX[pos.rua];
+      const z = (pos.col-0.5)*COL_SPACING;
+      const y = BASE_LEVEL_Y + (pos.niv-1)*LEVEL_HEIGHT + 1;
+      orbitTarget.set(x, y, z);
+      spherical.radius = 6; spherical.phi = Math.PI/4; spherical.theta = Math.PI/3;
+      syncCameraTargets();
+      setViewMode("orbit");
+    };
+
+    // pula pro INÍCIO da rua, olhando de frente pra ela — vendo a plaquinha
+    // com o nome/número (que fica em z=-1.4, antes da coluna 1)
+    api.current.jumpToRua = (rua)=>{
+      const layer = mainLayout.ruaX[rua]!==undefined ? mainLayout : ficticiaLayout;
+      const x = layer.ruaX[rua];
+      if(x===undefined) return;
+      orbitTarget.set(x, 1.8, 4);
+      spherical.radius = 11;
+      spherical.theta = Math.PI; spherical.phi = Math.PI/2.5;
+      syncCameraTargets();
+      setViewMode("orbit");
+    };
+
+    api.current.jumpToFicticio = ()=>{
+      if(!ficticiaLayout) return;
+      orbitTarget.set(ficticiaLayout.originX + ficticiaLayout.totalWidth/2 - ficticiaLayout.corridorSpanX/2, 1.7, ficticiaLayout.totalDepth/2);
+      spherical.radius = clamp(ficticiaLayout.totalWidth*0.7+10, 8, maxOrbitRadius);
+      spherical.theta = Math.PI*0.22; spherical.phi = Math.PI/3.1;
+      syncCameraTargets();
+      setViewMode("orbit");
+    };
+
+    api.current.resetView = ()=>{
+      // câmera de frente pro galpão inteiro, um pouco afastada e elevada,
+      // olhando ao longo do comprimento das ruas — vê todas lado a lado
+      // com os números, tipo "parado na entrada olhando pros corredores"
+      const overviewX = mainLayout.totalWidth/2 - mainLayout.corridorSpanX/2;
+      const overviewZ = Math.min(10, mainLayout.totalDepth*0.12);
+      orbitTarget.set(overviewX, 3, overviewZ);
+      spherical.radius = clamp(mainLayout.totalWidth*0.8 + 22, initialRadius, maxOrbitRadius);
+      spherical.theta = Math.PI;
+      spherical.phi = Math.PI/2.4;
+      syncCameraTargets();
+      setViewMode("orbit");
+    };
+
+    // Sempre que o modo "Andar" é ativado, a câmera passa a olhar para o
+    // MEIO da faixa de posições (não para um lugar aleatório da cena).
+    api.current.onModeChange = (m)=>{
+      if(m === "walk"){
+        walk.x = clamp(orbitTarget.x, -30, totalWidthAll+30);
+        walk.z = mainLayout.totalDepth/2; // sempre o meio das posições
+        walk.y = 1.6;
+        walk.yaw = 0;
+        walk.pitch = 0;
+        clampWalk();
+      } else {
+        orbitTarget.set(walk.x, 1.7, walk.z);
+        spherical.radius = 9; spherical.theta = walk.yaw + Math.PI; spherical.phi = Math.PI/3;
+        syncCameraTargets();
+        clampOrbitTarget();
+      }
+    };
+
+    /* ---------------------------------------------------------------------
+       Loop de renderização
+       --------------------------------------------------------------------- */
+    let rafId;
+    const clock = new THREE.Clock();
+    let elapsed = 0;
+    const LABEL_VISIBLE_DIST2 = 13*13; // só mostra a plaquinha da posição perto da câmera
+    let labelCullCounter = 0;
+    const animate = ()=>{
+      rafId = requestAnimationFrame(animate);
+      const dt = Math.min(clock.getDelta(), 0.05);
+      elapsed += dt;
+
+      if(viewModeRef.current === "orbit"){
+        // zoom suavizado (aproxima o raio atual do alvo aos poucos)
+        spherical.radius += (radiusTarget - spherical.radius) * Math.min(1, dt*10);
+        // momentum: se não está arrastando agora, continua girando com a
+        // velocidade do último movimento, decaindo suavemente até parar
+        if(!dragging && (Math.abs(thetaVelocity) > 0.00005 || Math.abs(phiVelocity) > 0.00005)){
+          spherical.theta += thetaVelocity;
+          spherical.phi = clamp(spherical.phi + phiVelocity, 0.15, Math.PI/2.05);
+          thetaVelocity *= 0.9;
+          phiVelocity *= 0.9;
+        }
+        const offset = new THREE.Vector3().setFromSpherical(spherical);
+        camera.position.copy(orbitTarget).add(offset);
+        camera.lookAt(orbitTarget);
+      } else {
+        const speed = (keys.ShiftLeft || keys.run ? 8 : 4.2) * dt;
+        const fwd = new THREE.Vector3(Math.sin(walk.yaw), 0, Math.cos(walk.yaw));
+        const right = new THREE.Vector3(Math.cos(walk.yaw), 0, -Math.sin(walk.yaw));
+        if(keys.KeyW || keys.ArrowUp)    { walk.x -= fwd.x*speed;   walk.z -= fwd.z*speed; }
+        if(keys.KeyS || keys.ArrowDown)  { walk.x += fwd.x*speed;   walk.z += fwd.z*speed; }
+        if(keys.KeyA || keys.ArrowLeft)  { walk.x -= right.x*speed; walk.z -= right.z*speed; }
+        if(keys.KeyD || keys.ArrowRight) { walk.x += right.x*speed; walk.z += right.z*speed; }
+        clampWalk();
+        camera.position.set(walk.x, walk.y, walk.z);
+        const look = new THREE.Vector3(
+          -Math.sin(walk.yaw)*Math.cos(walk.pitch),
+          Math.sin(walk.pitch),
+          -Math.cos(walk.yaw)*Math.cos(walk.pitch)
+        );
+        camera.lookAt(walk.x+look.x, walk.y+look.y, walk.z+look.z);
+      }
+
+      // hover
+      raycaster.setFromCamera(pointerNdc, camera);
+      const hits = raycaster.intersectObjects(allBoxLayers.map(l=>l.mesh));
+      const hit = hits.length>0 ? hits[0] : null;
+      const hitEntry = hit ? allBoxLayers.find(l=>l.mesh===hit.object).instances[hit.instanceId].entry : null;
+      if(hitEntry !== hoveredEntry){
+        const prev = hoveredEntry;
+        hoveredEntry = hitEntry;
+        if(prev){ const layer = allBoxLayers.find(l=>l.entries.includes(prev)); refreshEntryVisual(layer, prev); layer.mesh.instanceMatrix.needsUpdate=true; layer.mesh.instanceColor && (layer.mesh.instanceColor.needsUpdate=true); }
+        if(hoveredEntry){ const layer = allBoxLayers.find(l=>l.entries.includes(hoveredEntry)); refreshEntryVisual(layer, hoveredEntry); layer.mesh.instanceMatrix.needsUpdate=true; layer.mesh.instanceColor && (layer.mesh.instanceColor.needsUpdate=true); }
+        mount.style.cursor = hoveredEntry ? "pointer" : (viewModeRef.current==="walk" ? "crosshair" : "grab");
+      }
+
+      // o contorno pulsante é só um "sinal de longe" passivo, pra quando
+      // NENHUM filtro está ativo. Assim que um filtro entra, o destaque
+      // passa a ser 100% a cor sólida da caixa — o contorno some, pra não
+      // competir visualmente com o preenchimento.
+      const shouldPulse = currentModeType === "none";
+      const pulse = 0.35 + Math.sin(elapsed*4)*0.25;
+      alertMeshes.forEach(m=>{
+        m.visible = shouldPulse;
+        if(shouldPulse) m.material.opacity = pulse;
+      });
+
+      // plaquinhas de identificação: só ficam visíveis perto da câmera
+      // (recalculado a cada poucos quadros, não em todo frame, para custar
+      // menos processamento)
+      labelCullCounter++;
+      if(labelCullCounter % 6 === 0){
+        const cx = camera.position.x, cy = camera.position.y, cz = camera.position.z;
+        const vazioAtivo = currentModeType === "vazio";
+        allPosLabels.forEach(spr=>{
+          if(spr.userData.emptyLabel && !vazioAtivo){ spr.visible = false; return; }
+          const dx = spr.position.x-cx, dy = spr.position.y-cy, dz = spr.position.z-cz;
+          spr.visible = (dx*dx + dy*dy + dz*dz) < LABEL_VISIBLE_DIST2;
+        });
+      }
+
+      renderer.render(scene, camera);
+    };
+    animate();
+
+    const onResize = ()=>{
+      const w = mount.clientWidth, hgt = mount.clientHeight;
+      camera.aspect = w/hgt;
+      camera.updateProjectionMatrix();
+      renderer.setSize(w, hgt);
+    };
+    window.addEventListener("resize", onResize);
+
+    api.current.cleanup = ()=>{
+      cancelAnimationFrame(rafId);
+      window.removeEventListener("resize", onResize);
+      window.removeEventListener("pointerup", onPointerUp);
+      window.removeEventListener("pointercancel", onPointerUp);
+      window.removeEventListener("pointermove", onPointerMove);
+      window.removeEventListener("keydown", onKeyDown);
+      window.removeEventListener("keyup", onKeyUp);
+      renderer.domElement.removeEventListener("pointerdown", onPointerDown);
+      renderer.domElement.removeEventListener("wheel", onWheel);
+      renderer.domElement.removeEventListener("contextmenu", onContextMenu);
+      renderer.domElement.removeEventListener("mousemove", updatePointerNdc);
+      renderer.domElement.removeEventListener("click", onClick);
+      renderer.dispose();
+      if(mount.contains(renderer.domElement)) mount.removeChild(renderer.domElement);
+    };
+    return ()=> api.current.cleanup && api.current.cleanup();
+  }, [data, mainLayout, ficticiaLayout]);
+
+  /* =======================================================================
+     RENDER (React) — camada de UI sobre o canvas 3D
+     ======================================================================= */
+  if(error){
+    return h("div", { style:{ display:"flex", alignItems:"center", justifyContent:"center", height:"100vh",
+      color:"#ff8a80", fontFamily:"system-ui", fontSize:14, textAlign:"center", padding:20 } },
+      h("div", null, "Erro ao carregar estoque.json: ", error, h("br",null),
+        "Verifique se o arquivo está na mesma pasta que o index.html e se a conexão está estável."));
+  }
+  if(!data || !mainLayout){
+    return h("div", { style:{ display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center",
+      height:"100vh", color:"#a8a29a", fontFamily:"system-ui", fontSize:14, gap:12 } },
+      h("div", null, "Carregando armazém... ", progress>0 ? progress+"%" : ""),
+      h("div", { style:{ width:220, height:6, borderRadius:3, background:"#2a2e33", overflow:"hidden" } },
+        h("div", { style:{ width:progress+"%", height:"100%", background:"#8ecff5", transition:"width 0.2s" } })),
+      h("div", { style:{ fontSize:11, color:"#6b6f74" } }, "Baixando dados do estoque (~3.7 MB)"));
+  }
+
+  const dpadBtnStyle = { width:52, height:52, borderRadius:"50%", border:"1px solid rgba(255,255,255,0.15)",
+    background:"rgba(20,24,28,0.85)", color:"#f4efe6", fontSize:20, display:"flex", alignItems:"center",
+    justifyContent:"center", userSelect:"none", touchAction:"none" };
+  const dpadHandlers = (code)=>({
+    onPointerDown:(e)=>{ e.preventDefault(); api.current.setKey && api.current.setKey(code, true); },
+    onPointerUp:(e)=>{ e.preventDefault(); api.current.setKey && api.current.setKey(code, false); },
+    onPointerLeave:()=>{ api.current.setKey && api.current.setKey(code, false); },
+    onPointerCancel:()=>{ api.current.setKey && api.current.setKey(code, false); },
+  });
+
+  const filterBtnStyle = (active, color)=>({
+    background: active ? color : "rgba(255,255,255,0.08)",
+    color:"#f4efe6", border:"none", borderRadius:6, padding:"6px 12px", fontSize:12, fontWeight:600, cursor:"pointer"
+  });
+
+  const inputBaseStyle = { padding:"6px 10px", borderRadius:6, border:"1px solid rgba(255,255,255,0.15)",
+    background:"rgba(20,24,28,0.9)", color:"#f4efe6", fontSize:12, outline:"none" };
+
+  return h("div", { style:{ width:"100%", height:"100vh", display:"flex", flexDirection:"column",
+    background:"#0d1013", fontFamily:"'Inter', system-ui, sans-serif", overflow:"hidden" } },
+
+    // --- barra superior (fica no fluxo normal da página: nunca sobrepõe o resto) ---
+    h("div", { style:{ flex:"0 0 auto", display:"flex", justifyContent:"space-between", alignItems:"flex-start",
+      padding: isMobile ? "10px 12px" : "16px 20px", flexWrap:"wrap", gap:8,
+      background:"rgba(13,16,19,0.97)", borderBottom:"1px solid rgba(255,255,255,0.06)" } },
+
+      h("div", { style:{ flex:"1 1 240px", minWidth:0 } },
+        h("h1", { style:{ margin:0, fontSize: isMobile?16:20, color:"#f4efe6", letterSpacing:"-0.02em", fontFamily:"'JetBrains Mono', monospace" } }, "ARMAZÉM 3D — IMAGINAE"),
+        h("p", { style:{ margin:"2px 0 8px", fontSize: isMobile?11:12, color:"#a8a29a" } },
+          data.length.toLocaleString("pt-BR"), " posições \xB7 ", totalItens.toLocaleString("pt-BR"), " lotes/SKUs \xB7 ",
+          mainLayout.ruas.length, " ruas",
+          totalAlertas>0 && h("span", { style:{ color:"#ff8a80" } }, " \xB7 ", totalAlertas, " com alerta \u26A0"),
+          ruasLotadas>0 && h("span", { style:{ color:"#e8a13a" } }, " \xB7 ", ruasLotadas, " rua(s) quase lotada(s) \u2265 85%")),
+
+        // no celular os filtros ficam recolhidos por padrão (evita empilhar tudo na tela toda)
+        isMobile && h("button", { onClick:()=>setFiltersOpen(o=>!o), style:{ margin:"2px 0 8px", padding:"6px 12px",
+          borderRadius:6, border:"1px solid rgba(255,255,255,0.15)", background:"rgba(255,255,255,0.06)",
+          color:"#f4efe6", fontSize:12, fontWeight:600, cursor:"pointer" } }, (filtersOpen ? "\u25B2 Ocultar" : "\u25BC") + " Busca e filtros"),
+
+        (filtersOpen || !isMobile) && h("div", { style:{ display:"flex", gap:6, flexWrap:"wrap", marginBottom:6 } },
+          h("input", { type:"text", value:searchText, onChange:(e)=>onSearchChange(e.target.value),
+            placeholder:"Buscar posição ou código...", style:{ ...inputBaseStyle, width: isMobile ? "100%" : 190 } }),
+          h("select", { value: mode.type==="cliente" ? mode.value : "", onChange:(e)=>onClienteChange(e.target.value),
+            style:{ ...inputBaseStyle, width: isMobile ? "100%" : 150 } },
+            h("option", { value:"" }, "Filtrar por cliente..."),
+            clientes.map(c => h("option", { key:c, value:c }, c))),
+          h("select", { value: mode.type==="familia" ? mode.value : "", onChange:(e)=>onFamiliaChange(e.target.value),
+            style:{ ...inputBaseStyle, width: isMobile ? "100%" : 150 } },
+            h("option", { value:"" }, "Filtrar por família..."),
+            familias.map(f => h("option", { key:f, value:f }, f))),
+          h("button", { onClick:()=>toggleMode("risco"), style: filterBtnStyle(mode.type==="risco", "#e8a13a") }, "\u26A0 Vence em breve"),
+          h("button", { onClick:()=>toggleMode("vencido"), style: filterBtnStyle(mode.type==="vencido", "#c0392b") }, "\u23F0 Vencidos"),
+          h("button", { onClick:()=>toggleMode("danificado"), style: filterBtnStyle(mode.type==="danificado", "#c0392b") }, "\u2757 Danificados"),
+          h("button", { onClick:()=>toggleMode("vazio"), style: filterBtnStyle(mode.type==="vazio", "#2a9d8f") }, "\u25A2 Vazias"),
+          mode.type!=="none" && h("button", { onClick:()=>{ setSearchText(""); setMode({type:"none"}); },
+            style:{ padding:"6px 10px", borderRadius:6, border:"1px solid rgba(255,255,255,0.15)",
+            background:"rgba(255,255,255,0.06)", color:"#a8a29a", fontSize:12, cursor:"pointer" } }, "Limpar"),
+
+          h("label", { style:{ padding:"6px 12px", borderRadius:6, border:"1px solid rgba(142,207,245,0.4)",
+            background: importStatus && importStatus.state==="loading" ? "rgba(142,207,245,0.25)" : "rgba(142,207,245,0.12)",
+            color:"#8ecff5", fontSize:12, fontWeight:600, cursor:"pointer", display:"inline-flex", alignItems:"center", gap:6,
+            width: isMobile ? "100%" : "auto", justifyContent:"center" } },
+            importStatus && importStatus.state==="loading" ? "Lendo planilha..." : "\u2B06 Atualizar planilha (ERP)",
+            h("input", { type:"file", accept:".xls,.xlsx,.csv", style:{ display:"none" },
+              onChange:(e)=>{ const f = e.target.files && e.target.files[0]; handleErpFileSelected(f); e.target.value = ""; } }))
+        ),
+
+        (filtersOpen || !isMobile) && importStatus && importStatus.state==="success" && h("div", { style:{ fontSize:11, color:"#7fd99a", marginBottom:6 } },
+          "\u2713 Planilha atualizada \u00e0s ", importStatus.at.toLocaleTimeString("pt-BR"), " \u2014 ",
+          importStatus.posCount.toLocaleString("pt-BR"), " posições, ", importStatus.itemCount.toLocaleString("pt-BR"), " itens"),
+        (filtersOpen || !isMobile) && importStatus && importStatus.state==="error" && h("div", { style:{ fontSize:11, color:"#ff8a80", marginBottom:6 } },
+          "\u26A0 Erro ao ler a planilha: ", importStatus.message),
+
+        (filtersOpen || !isMobile) && modeLabel && h("div", { style:{ marginTop:6, maxHeight: isMobile ? 220 : 280, overflowY:"auto",
+          background:"rgba(17,20,23,0.97)", borderRadius:6, border:"1px solid rgba(255,255,255,0.1)", width: isMobile ? "100%" : 320 } },
+          h("div", { style:{ padding:"6px 10px", fontSize:11, color:"#8ecff5", borderBottom:"1px solid rgba(255,255,255,0.08)" } }, modeLabel),
+          mode.type==="busca" && h(React.Fragment, null,
+            searchResults.length===0 && h("div", { style:{ padding:8, fontSize:12, color:"#a8a29a" } }, "Nenhum resultado"),
+            searchResultsShown.map(p => h("div", { key:p.pos, onClick:()=>focusPosition(p),
+              style:{ padding:"6px 10px", fontSize:12, color:"#f4efe6", cursor:"pointer", borderBottom:"1px solid rgba(255,255,255,0.06)" } },
+              h("strong", { style:{ color:"#e8a13a" } }, p.pos), " \u2014 rua ", p.rua, " \xB7 ", p.itens.length, " ", p.itens.length===1?"item":"itens",
+              p.alerta && h("span", { style:{ color:"#ff8a80" } }, " \u26A0"))),
+            searchResults.length>searchResultsShown.length && h("div", { style:{ padding:"6px 10px", fontSize:11, color:"#6b6f74" } },
+              "+ ", searchResults.length-searchResultsShown.length, " posições (refine a busca para ver todas)")
+          )
+        )
+      ),
+
+      h("div", { style:{ display:"flex", gap:6, flexWrap:"wrap" } },
+        h("button", { onClick:()=>setInfoOpen(o=>!o), style:{ background: infoOpen ? "#2a6f77" : "rgba(255,255,255,0.08)",
+          color:"#8ecff5", border:"none", borderRadius:6, padding:"6px 12px", fontSize:12, fontWeight:600, cursor:"pointer" } }, "\u2139\uFE0F Dados do galpão"),
+        h("button", { onClick:()=>setAnaliseOpen(o=>!o), style:{ background: analiseOpen ? "#c9781f" : "rgba(255,255,255,0.08)",
+          color: analiseOpen ? "#1c1408" : "#e8a13a", border:"none", borderRadius:6, padding:"6px 12px", fontSize:12, fontWeight:600, cursor:"pointer" } }, "\u{1F9E0} Análise IA"),
+        h("button", { onClick: resetView, style:{ background:"rgba(255,255,255,0.08)", color:"#f4efe6", border:"none",
+          borderRadius:6, padding:"6px 12px", fontSize:12, fontWeight:600, cursor:"pointer" } }, "\u{1F3E0} Visão geral"),
+        [["orbit","\u{1F5B1}\uFE0F Órbita"], ["walk","\u{1F6B6} Andar"]].map(([m,label]) =>
+          h("button", { key:m, onClick:()=>setViewMode(m), style:{ background: viewMode===m ? "#2a6f77" : "rgba(255,255,255,0.08)",
+            color:"#f4efe6", border:"none", borderRadius:6, padding:"6px 12px", fontSize:12, fontWeight:600, cursor:"pointer" } }, label))
+      )
+    ),
+
+    // --- barra de ruas (atalhos) com indicador de ocupação — também no fluxo normal ---
+    h("div", { style:{ flex:"0 0 auto", display:"flex", gap:4, overflowX:"auto",
+      padding: isMobile ? "6px 10px" : "6px 20px", background:"rgba(13,16,19,0.97)",
+      borderBottom:"1px solid rgba(255,255,255,0.06)" } },
+      mainLayout.ruas.map(r => {
+        const oc = ocupacaoPorRua[r] || { ocupado:0, capacidade:0, pct:0 };
+        const pctShow = Math.round(oc.pct*100);
+        // verde (livre) -> amarelo -> vermelho (lotado)
+        const barColor = oc.pct < 0.6 ? "#2e8b57" : oc.pct < 0.85 ? "#e8a13a" : "#c0392b";
+        return h("button", { key:r, onClick:()=>jumpToRua(r), title: "Rua " + r + ": " + oc.ocupado + "/" + oc.capacidade + " posições ocupadas (" + pctShow + "%)",
+          style:{ flex:"0 0 auto", padding:"4px 10px 6px", borderRadius:10, fontSize:11, fontWeight:600,
+          border:"1px solid rgba(255,255,255,0.12)", background:"rgba(20,24,28,0.75)", color:"#e8a13a",
+          cursor:"pointer", display:"flex", flexDirection:"column", alignItems:"center", gap:3, minWidth:38 } },
+          h("span", null, r),
+          h("div", { style:{ width:26, height:4, borderRadius:2, background:"rgba(255,255,255,0.12)", overflow:"hidden" } },
+            h("div", { style:{ width: pctShow+"%", height:"100%", background:barColor } })),
+          h("span", { style:{ fontSize:8, color:"#6b6f74", fontWeight:400 } }, pctShow+"%")
+        );
+      }),
+      ficticiaLayout && h("button", { onClick: jumpToFicticio, style:{ flex:"0 0 auto", padding:"4px 10px",
+        borderRadius:14, fontSize:11, fontWeight:600, border:"1px solid rgba(217,164,255,0.4)",
+        background:"rgba(106,75,138,0.35)", color:"#d9a4ff", cursor:"pointer", alignSelf:"center" } }, "\u26A0 Bloco fictício")
+    ),
+
+    // --- área principal: viewport 3D + tudo que flutua por cima dela ---
+    h("div", { style:{ position:"relative", flex:"1 1 auto", minHeight:0, overflow:"hidden" } },
+
+      // --- legenda ---
+      !(isMobile && viewMode==="walk") && h("div", { style:{ position:"absolute", bottom:16, left: isMobile?12:20, zIndex:10,
+        background:"rgba(20,24,28,0.85)", padding: isMobile ? "8px 10px" : "10px 14px", borderRadius:8,
+        fontSize: isMobile?10:11, color:"#a8a29a", pointerEvents:"none", maxWidth: isMobile ? 220 : 340 } },
+        h("div", { style:{ marginBottom:4 } },
+          h("span", { style:{ display:"inline-block", width:10, height:10, background:"#c9a06a", borderRadius:2, marginRight:4, verticalAlign:"middle" } }),
+          "Palete \xB7 ",
+          h("span", { style:{ display:"inline-block", width:10, height:10, background:"#caa06e", borderRadius:2, margin:"0 4px 0 8px", verticalAlign:"middle" } }),
+          "Caixas (volume aproximado pela qtd. de lotes/SKUs)"),
+        h("div", { style:{ marginBottom:4 } }, "Contorno pulsante: ",
+          h("span", { style:{ color:"#ff8a80" } }, "vermelho"), "=vencido \xB7 ",
+          h("span", { style:{ color:"#ff8c1a" } }, "laranja"), "\u22647d \xB7 ",
+          h("span", { style:{ color:"#f0d060" } }, "amarelo"), "\u226415d"),
+        h("div", null, "Filtros pintam sólido: ",
+          h("span", { style:{ color:"#ffd400" } }, "amarelo"), "=cliente \xB7 ",
+          h("span", { style:{ color:"#ff8a80" } }, "vermelho"), "=vencido/danificado/a vencer \xB7 branco=vazia"),
+        !isMobile && h("div", { style:{ marginTop:6, opacity:0.8 } },
+          viewMode==="orbit" ? "Órbita: arraste para girar \xB7 Ctrl+arraste (mouse) p/ andar pelo corredor \xB7 2 dedos p/ mover e afastar/aproximar \xB7 toque num bloco"
+                              : "Andar: use as setas na tela (ou WASD) \xB7 arraste p/ olhar \xB7 toque num bloco")
+      ),
+
+      // --- viewport 3D ---
+      h("div", { ref: mountRef, style:{ width:"100%", height:"100%", cursor: viewMode==="walk" ? "crosshair" : "grab" } }),
+
+      // --- controles de caminhada ---
+      viewMode==="walk" && h("div", { style:{ position:"absolute", top: isMobile?12:16, left: isMobile?12:20, zIndex:10,
+        display:"flex", gap:6 } },
+        h("button", { onClick:()=>setWalkInputMode("mouse"), style:{ padding:"6px 12px", borderRadius:6,
+          border:"none", background: walkInputMode==="mouse" ? "#2a6f77" : "rgba(20,24,28,0.85)",
+          color:"#f4efe6", fontSize:12, fontWeight:600, cursor:"pointer" } }, "\u{1F5B1}\uFE0F Mouse"),
+        h("button", { onClick:()=>setWalkInputMode("teclado"), style:{ padding:"6px 12px", borderRadius:6,
+          border:"none", background: walkInputMode==="teclado" ? "#2a6f77" : "rgba(20,24,28,0.85)",
+          color:"#f4efe6", fontSize:12, fontWeight:600, cursor:"pointer" } }, "\u2328\uFE0F Teclado")
+      ),
+
+      viewMode==="walk" && walkInputMode==="mouse" && h("div", { style:{ position:"absolute", bottom: isMobile?16:24, right: isMobile?16:24, zIndex:10 } },
+        h("div", { style:{ display:"grid", gridTemplateColumns:"repeat(3, 52px)", gridTemplateRows:"repeat(2, 52px)", gap:6, justifyItems:"center" } },
+          h("div", null), h("button", { style:dpadBtnStyle, ...dpadHandlers("KeyW") }, "\u25B2"), h("div", null),
+          h("button", { style:dpadBtnStyle, ...dpadHandlers("KeyA") }, "\u25C0"),
+          h("button", { style:dpadBtnStyle, ...dpadHandlers("KeyS") }, "\u25BC"),
+          h("button", { style:dpadBtnStyle, ...dpadHandlers("KeyD") }, "\u25B6")),
+        h("button", { style:{ ...dpadBtnStyle, width:"100%", borderRadius:10, marginTop:8, fontSize:12 }, ...dpadHandlers("run") }, "\u{1F3C3} Correr"),
+        h("div", { style:{ marginTop:8, fontSize:10, color:"#a8a29a", textAlign:"center", maxWidth:170 } }, "Arraste a tela p/ olhar ao redor \xB7 use as setas pra andar")),
+
+      viewMode==="walk" && walkInputMode==="teclado" && h("div", { style:{ position:"absolute", bottom: isMobile?16:24, right: isMobile?16:24, zIndex:10,
+        background:"rgba(20,24,28,0.88)", borderRadius:10, padding:"12px 16px", color:"#f4efe6", fontSize:12, maxWidth:200 } },
+        h("div", { style:{ fontWeight:700, marginBottom:6 } }, "\u2328\uFE0F Controles do teclado"),
+        h("div", null, "W A S D ou setas \u2014 andar"),
+        h("div", null, "Shift \u2014 correr"),
+        h("div", { style:{ marginTop:4, color:"#a8a29a" } }, "Arraste o mouse na tela p/ olhar ao redor")),
+
+      h(DetailPanel, { selected, onClose:()=>setSelected(null) }),
+      h(InfoGalpaoPanel, { open: infoOpen, onClose:()=>setInfoOpen(false), isMobile }),
+      h(AnaliseIAPanel, { open: analiseOpen, onClose:()=>setAnaliseOpen(false), isMobile,
+        geminiKey, analise, loading: analiseLoading, erro: analiseErro, onGerar: gerarAnalise }),
+
+      // --- IA do estoque (Gemini) : botão flutuante + painel de chat ---
+      // no celular, em modo "Andar" o D-pad ocupa o canto inferior direito, então o chat sobe pro topo pra não colidir
+      h("button", {
+        onClick:()=>setChatOpen(o=>!o),
+        style:{ position:"absolute", ...(isMobile && viewMode==="walk" ? { top:16 } : { bottom:16 }), right:16, zIndex:12,
+          width:52, height:52, borderRadius:"50%",
+          border:"1px solid rgba(142,207,245,0.5)", background: chatOpen ? "#2e6f77" : "rgba(20,24,28,0.92)",
+          color:"#8ecff5", fontSize:22, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center" }
+      }, "\u{1F916}"),
+
+      chatOpen && h("div", { style:{ position:"absolute",
+        ...(isMobile && viewMode==="walk" ? { top:76 } : { bottom:76 }), right:16, zIndex:12,
+        width: isMobile ? 300 : 320, maxWidth:"90vw",
+        maxHeight:"60vh", background:"rgba(17,20,23,0.98)", border:"1px solid rgba(142,207,245,0.3)", borderRadius:10,
+        display:"flex", flexDirection:"column", overflow:"hidden", boxShadow:"0 8px 24px rgba(0,0,0,0.5)" } },
+
+      h("div", { style:{ padding:"10px 12px", borderBottom:"1px solid rgba(255,255,255,0.08)", display:"flex",
+        alignItems:"center", justifyContent:"space-between" } },
+        h("strong", { style:{ fontSize:13, color:"#8ecff5" } }, "\u{1F916} IA do Estoque"),
+        h("button", { onClick:()=>setChatOpen(false), style:{ background:"none", border:"none", color:"#a8a29a",
+          fontSize:16, cursor:"pointer" } }, "\u2715")),
+
+      !geminiKey ? h("div", { style:{ padding:12, fontSize:12, color:"#a8a29a", display:"flex", flexDirection:"column", gap:8 } },
+        h("div", null, "Cole sua chave gratuita da API do Gemini (pegue em ",
+          h("a", { href:"https://aistudio.google.com/apikey", target:"_blank", rel:"noopener noreferrer",
+            style:{ color:"#8ecff5" } }, "aistudio.google.com/apikey"), "). Fica salva só nesse navegador."),
+        h("input", { type:"password", value:geminiKeyInput, onChange:(e)=>setGeminiKeyInput(e.target.value),
+          placeholder:"AIza...", style:{ padding:"6px 8px", borderRadius:6, border:"1px solid rgba(255,255,255,0.15)",
+          background:"rgba(20,24,28,0.9)", color:"#f4efe6", fontSize:12, outline:"none" } }),
+        h("button", { onClick:saveGeminiKey, style:{ padding:"6px 10px", borderRadius:6, border:"none",
+          background:"#2e6f77", color:"#f4efe6", fontSize:12, fontWeight:600, cursor:"pointer" } }, "Salvar chave"))
+
+      : h(React.Fragment, null,
+        h("div", { style:{ flex:1, overflowY:"auto", padding:"10px 12px", display:"flex", flexDirection:"column", gap:8, fontSize:12 } },
+          chatMessages.length===0 && h("div", { style:{ color:"#6b6f74" } },
+            "Pergunte, por exemplo: \"quantos itens estão vencidos?\", \"o que tem na posição ", 
+            data.length ? data[0].pos : "A.01.1", "?\" ou \"quais clientes têm mais itens danificados?\""),
+          chatMessages.map((m,i)=> h("div", { key:i, style:{
+              alignSelf: m.role==="user" ? "flex-end" : "flex-start",
+              maxWidth:"90%", padding:"6px 10px", borderRadius:8, whiteSpace:"pre-wrap",
+              background: m.role==="user" ? "#2e6f77" : m.role==="erro" ? "rgba(192,57,43,0.25)" : "rgba(255,255,255,0.06)",
+              color: m.role==="erro" ? "#ff8a80" : "#f4efe6" } },
+            m.text)),
+          chatLoading && h("div", { style:{ color:"#6b6f74", alignSelf:"flex-start" } }, "Pensando...")),
+
+        h("div", { style:{ padding:8, borderTop:"1px solid rgba(255,255,255,0.08)", display:"flex", gap:6 } },
+          h("input", { type:"text", value:chatInput, onChange:(e)=>setChatInput(e.target.value),
+            onKeyDown:(e)=>{ if(e.key==="Enter") sendChatMessage(); },
+            placeholder:"Pergunte sobre o estoque...", style:{ flex:1, padding:"6px 8px", borderRadius:6,
+            border:"1px solid rgba(255,255,255,0.15)", background:"rgba(20,24,28,0.9)", color:"#f4efe6",
+            fontSize:12, outline:"none" } }),
+          h("button", { onClick:sendChatMessage, disabled:chatLoading, style:{ padding:"6px 12px", borderRadius:6,
+            border:"none", background:"#2e6f77", color:"#f4efe6", fontSize:12, fontWeight:600,
+            cursor: chatLoading ? "default" : "pointer", opacity: chatLoading ? 0.6 : 1 } }, "Enviar"),
+          h("button", { onClick:forgetGeminiKey, title:"Esquecer chave salva", style:{ padding:"6px 8px",
+            borderRadius:6, border:"1px solid rgba(255,255,255,0.15)", background:"transparent",
+            color:"#6b6f74", fontSize:11, cursor:"pointer" } }, "\u{1F511}"),
+          h("button", { onClick:limparConversa, title:"Limpar conversa salva", style:{ padding:"6px 8px",
+            borderRadius:6, border:"1px solid rgba(255,255,255,0.15)", background:"transparent",
+            color:"#6b6f74", fontSize:11, cursor:"pointer" } }, "\u{1F5D1}\uFE0F")))
+      )
+    )
+  );
+}
+
+const root = ReactDOM.createRoot(document.getElementById("root"));
+root.render(h(Armazem3D, null));
+</script>
+</body>
+</html>
